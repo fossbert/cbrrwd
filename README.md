@@ -11,7 +11,6 @@ round this out.
 
 ```bash
 pip install -e .                 # core: numpy, pandas, scipy, statsmodels
-pip install -e '.[plotting]'     # sqrt_ax, label_heatmap (needs matplotlib)
 pip install -e '.[r]'            # fisher_test on r x c tables, gdrate (needs R + tumgr)
 pip install -e '.[all,test]'
 ```
@@ -23,7 +22,6 @@ pip install -e '.[all,test]'
 | `cbrrwd.regimens` | `Medication`, `Regime`, `ChemoDetail`, `validate_meds`, `parse_application_string`, `calculate_applications`, `applications_to_treatment_days`, `determine_treatment_days`, `calc_total_days_on_therapy`, `validate_chemo_protocol`, `med_info`, `unpack_regime`, `calculate_rdi` |
 | `cbrrwd.linkage` | `find_closest` (nearest record by date, per patient) |
 | `cbrrwd.pvalues` | `cut_p`, `fdr`, `fisher_test` |
-| `cbrrwd.plotting` | `sqrt_ax`, `label_heatmap` (needs the `plotting` extra) |
 | `cbrrwd.rbackend.contingency` | `fisher_exact_rc` (r x c fallback for `fisher_test`) |
 | `cbrrwd.rbackend.tumor_growth` | `gdrate` (Wilkerson et al. 2017 tumor growth/decay model, needs CRAN package `tumgr`) |
 
@@ -115,8 +113,7 @@ plus base R -- no extra CRAN package).
   `calculate_applications`, `applications_to_treatment_days`,
   `determine_treatment_days`, `calc_total_days_on_therapy`,
   `validate_chemo_protocol`, `med_info`, `unpack_regime`, `calculate_rdi`,
-  `cut_p`, `find_closest`, `sqrt_ax` (needs `plotting` extra), `label_heatmap`
-  (needs `plotting` extra), `gdrate` (`cbrrwd.rbackend.tumor_growth.gdrate`,
+  `cut_p`, `find_closest`, `gdrate` (`cbrrwd.rbackend.tumor_growth.gdrate`,
   needs `r` extra).
 * `fisher_test` now uses SciPy for 2x2 tables (no R needed) and only falls
   back to R for r x c tables.
@@ -127,3 +124,5 @@ plus base R -- no extra CRAN package).
   `cbrrwd.rbackend.contingency.fisher_exact_rc` directly), the standalone
   `numpy_to_rpy2`/`pandas_to_rpy2`/etc. converters (now internal to
   `cbrrwd.rbackend`).
+* Dropped (out of scope for this package): `sqrt_ax`, `label_heatmap` --
+  generic matplotlib helpers, not RWD-analysis specific.
