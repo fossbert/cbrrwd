@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cbrrwd"
+version = "0.1.0"
+description = "Real-world-data analysis helpers for systemic (chemo/immuno-)therapy: dose-intensity from applied-medication records, plus general RWD linkage and stats utilities"
+authors = [{ name = "H. Carlo Maurer", email = "h.carlo.maurer@gmail.com" }]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+keywords = ["real-world-data", "oncology", "chemotherapy", "dose-intensity", "rdi", "clinical"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+dependencies = [
+    "numpy>=1.23",
+    "pandas>=2.2",
+    "scipy>=1.11",
+    "statsmodels>=0.13",   # multipletests (BH-FDR)
+]
+
+[project.optional-dependencies]
+plotting = ["matplotlib>=3.6"]
+r = ["rpy2>=3.5"]          # plus R packages: stats (base), tumgr
+all = ["cbrrwd[plotting,r]"]
+test = ["pytest>=7", "matplotlib>=3.6"]
+dev = ["cbrrwd[all,test]", "build", "twine", "ruff"]
+
+[project.urls]
+Repository = "https://github.com/fossbert/cbrrwd"
+Issues = "https://github.com/fossbert/cbrrwd/issues"
+
+[tool.setuptools.packages.find]
+include = ["cbrrwd*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
