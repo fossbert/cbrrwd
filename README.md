@@ -182,8 +182,8 @@ the application count grows.
 
 Occasionally one component of a combination starts later than day 1 -- e.g.
 FOLFOX (5-FU + oxaliplatin) added only from day 29 of a 42-day
-Gem/nab-paclitaxel cycle, as in the SEQUENCE regimen for biliary tract
-cancer:
+Gem/nab-paclitaxel cycle, as in the SEQUENCE regimen for pancreatic ductal
+adenocarcinoma:
 
 ```python
 GEM = rwd.Medication("GEM", [1, 8, 15], 42)
