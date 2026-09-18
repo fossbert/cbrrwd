@@ -17,16 +17,19 @@ from __future__ import annotations
 from .linkage import find_closest
 from .pvalues import cut_p, fdr, fisher_test
 from .regimens import (
-    ChemoDetail,
     Medication,
     Regime,
     applications_to_treatment_days,
     calc_total_days_on_therapy,
     calculate_applications,
     calculate_rdi,
+    calculate_rdi_theoretical,
     determine_treatment_days,
     med_info,
     parse_application_string,
+    parse_patient_regimen,
+    real_time_since_medication_start,
+    theoretical_applications_table,
     unpack_regime,
     validate_chemo_protocol,
     validate_meds,
@@ -39,17 +42,20 @@ __all__ = [
     # regimens
     "Medication",
     "Regime",
-    "ChemoDetail",
     "validate_meds",
     "parse_application_string",
     "calculate_applications",
     "applications_to_treatment_days",
+    "real_time_since_medication_start",
     "determine_treatment_days",
     "calc_total_days_on_therapy",
     "validate_chemo_protocol",
     "med_info",
     "unpack_regime",
     "calculate_rdi",
+    "calculate_rdi_theoretical",
+    "theoretical_applications_table",
+    "parse_patient_regimen",
     # linkage
     "find_closest",
     # pvalues

@@ -22,17 +22,20 @@ import pandas as pd
 __all__ = [
     "Medication",
     "Regime",
-    "ChemoDetail",
     "validate_meds",
     "parse_application_string",
     "calculate_applications",
     "applications_to_treatment_days",
+    "real_time_since_medication_start",
     "determine_treatment_days",
     "calc_total_days_on_therapy",
     "validate_chemo_protocol",
     "med_info",
     "unpack_regime",
     "calculate_rdi",
+    "calculate_rdi_theoretical",
+    "theoretical_applications_table",
+    "parse_patient_regimen",
 ]
 
 
@@ -77,17 +80,6 @@ class Regime:
         required = tuple(m.name for m in self.meds if m.required)
         optional = tuple(m.name for m in self.meds if not m.required)
         return required, optional
-
-
-@dataclass
-class ChemoDetail:
-    """Per-medication result row: applications, average dose, time on treatment."""
-
-    medication: str = None
-    applications: int = None
-    avg_dose: int = None
-    time_on_treatment_real: int = None
-    time_on_treatment_asper_applications: int = None
 
 
 def validate_meds(application_string: str, required: Iterable[str], optional: Iterable[str]) -> bool:
@@ -136,11 +128,67 @@ def parse_application_string(application_string: str, time_on_treatment_real: in
     Optional medications not present in the input string are included with
     zero applications.
 
+    If `application_string` is NaN (no record of what was applied), a
+    DataFrame with the same shape and columns is returned, but with NaN in
+    place of every derived value instead of 0. This keeps it usable by the
+    same downstream code (e.g. :func:`calculate_rdi`) while distinguishing
+    "no data available" from a genuine zero (e.g. an optional medication that
+    was not given).
+
+    ``time_on_treatment_real`` in the result is the regimen-wide real span
+    (Erste_Gabe to Letzte_Gabe, anchored to day 1 of the whole regimen) --
+    correct for reporting, but the wrong reference frame for a medication
+    that only enters the regimen partway through a cycle (e.g. FOLFOX added
+    from day 29 of a 42-day Gem/nab-paclitaxel cycle, as in the SEQUENCE
+    regimen). ``time_on_treatment_real_since_start`` is that same span
+    re-anchored to this medication's own first possible treatment day (see
+    :func:`real_time_since_medication_start`); it is what
+    :func:`calculate_rdi`/:func:`calculate_rdi_theoretical` should be fed as
+    their ``time_on_treatment_real`` argument. For a medication starting on
+    day 1 of the cycle (the common case) the two are identical.
+
+    Known limitation -- early-stopping component of a combo: the re-anchoring
+    only corrects for a *late start*, because a medication's own first
+    possible day is a structural fact of the protocol (independent of what
+    actually happened). There is no equivalent correction for a medication
+    that *stops early* while another component of the same combo continues
+    (e.g. 2 cycles of Gem/nab-paclitaxel + FOLFOX per SEQUENCE, then a 3rd
+    cycle of FOLFOX alone as bridging): the *when* a component's own last
+    dose was given is a clinical fact, not derivable from the schedule, and
+    is not captured anywhere in ``application_string`` or the single, shared
+    ``time_on_treatment_real`` for the whole regimen. In that situation the
+    component that stopped early is still charged with the full regimen-wide
+    real time, which understates its RDI. Fixing this properly needs
+    medication-specific first/last-application dates, or the therapy course
+    split into separate segments per regime/protocol change -- each parsed
+    with its own :func:`parse_application_string` call and its own
+    ``time_on_treatment_real`` -- rather than one combined call across a
+    regimen switch.
+
     Returns
     -------
     pd.DataFrame
-        Indexed by medication name.
+        Indexed by medication name, with columns ``applications``,
+        ``avg_dose``, ``time_on_treatment_real``,
+        ``time_on_treatment_real_since_start`` and
+        ``time_on_treatment_asper_applications``.
     """
+
+    if pd.isna(application_string):
+        med_list = [
+            {
+                "medication": med_obj.name,
+                "applications": np.nan,
+                "avg_dose": np.nan,
+                "time_on_treatment_real": time_on_treatment_real,
+                "time_on_treatment_real_since_start": real_time_since_medication_start(
+                    time_on_treatment_real, med_obj.treatment_days
+                ),
+                "time_on_treatment_asper_applications": np.nan,
+            }
+            for med_obj in regime.meds
+        ]
+        return pd.DataFrame(med_list).set_index("medication")
 
     required, optional = regime.get_required_optional()
 
@@ -179,21 +227,26 @@ def parse_application_string(application_string: str, time_on_treatment_real: in
 
         n_applications, avg_dose = parsed.get(med, (0, 0))
 
+        med_treatment_days = treatment_days_dict.get(med)
+
+        time_on_treatment_real_since_start = real_time_since_medication_start(
+            time_on_treatment_real, med_treatment_days
+        )
+
         time_on_treatment_asper_applications = applications_to_treatment_days(
-            treatment_days_dict.get(med),
+            med_treatment_days,
             cycle_len_days_dict.get(med),
             n_applications
         )
 
-        med_list.append(
-            ChemoDetail(
-                med,
-                n_applications,
-                avg_dose,
-                time_on_treatment_real,
-                time_on_treatment_asper_applications
-            )
-        )
+        med_list.append({
+            "medication": med,
+            "applications": n_applications,
+            "avg_dose": avg_dose,
+            "time_on_treatment_real": time_on_treatment_real,
+            "time_on_treatment_real_since_start": time_on_treatment_real_since_start,
+            "time_on_treatment_asper_applications": time_on_treatment_asper_applications,
+        })
 
     return pd.DataFrame(med_list).set_index("medication")
 
@@ -219,7 +272,11 @@ def calculate_applications(treatment_days: list, cycle_len_days: int, total_days
     Returns
     -------
     tuple
-        ``(applications_count, last_treatment_day)``.
+        ``(applications_count, last_treatment_day)``. ``last_treatment_day``
+        is ``None`` if ``total_days_on_therapy`` falls before this
+        medication's own first possible treatment day (0 applications) --
+        e.g. therapy stopped before a medication added only later in the
+        cycle (day 29 of a 42-day cycle, say) was ever reached.
     """
 
     treatment_days = np.array(treatment_days)
@@ -231,6 +288,9 @@ def calculate_applications(treatment_days: list, cycle_len_days: int, total_days
         total_days_on_therapy += 1
 
     treatment_days_array_pruned = determine_treatment_days(treatment_days, cycle_len_days, total_days_on_therapy)
+
+    if len(treatment_days_array_pruned) == 0:
+        return 0, None
 
     last_treatment_day = treatment_days_array_pruned[-1]
 
@@ -275,6 +335,28 @@ def applications_to_treatment_days(treatment_days: list[int], cycle_len_days: in
         number_of_days = 1
 
     return number_of_days
+
+
+def real_time_since_medication_start(time_on_treatment_real: int, treatment_days: list[int]) -> int:
+    """
+    Re-anchor a regimen-wide real elapsed time to one medication's own start.
+
+    :func:`applications_to_treatment_days` already counts a medication's own
+    first treatment day as day 0 elapsed (e.g. day 29 of a cycle becomes 28).
+    ``time_on_treatment_real`` (from :func:`calc_total_days_on_therapy`) is
+    anchored to day 1 of the whole regimen instead -- correct for a
+    medication that starts on day 1, but too large for one added only later
+    in the cycle (e.g. FOLFOX added from day 29 of a 42-day
+    Gem/nab-paclitaxel cycle, as in the SEQUENCE regimen). Comparing the two
+    directly would compare different reference frames.
+
+    Time elapsed before this medication's own first possible day is not
+    attributable to it, so it is subtracted here. A medication that has not
+    yet reached its own start day gets 0, never a negative number.
+    """
+
+    offset = min(treatment_days) - 1
+    return max(0, time_on_treatment_real - offset)
 
 
 def determine_treatment_days(treatment_days: np.ndarray, cycle_len_days: int, total_days_on_therapy: int) -> np.ndarray:
@@ -350,6 +432,7 @@ def calculate_rdi(avg_dose: float,
                    applications_planned: int,
                    avg_dose_planned: float,
                    time_on_treatment_planned: int) -> float:
+    
     """Berechnet die reale Dosisintensität (RDI) unter Berücksichtigung von Abbruch, Verzögerung
     und dynamischer Protokoll-Erweiterung bei ungewöhnlich langer Therapiedauer.
     """
@@ -384,3 +467,140 @@ def calculate_rdi(avg_dose: float,
     dose_intensity_real = (avg_dose * applications) / relevant_time
 
     return round((dose_intensity_real / dose_intensity_planned) * 100, 2)
+
+
+def calculate_rdi_theoretical(avg_dose: float,
+                               applications: int,
+                               time_on_treatment_real: int,
+                               time_on_treatment_asper_applications: int) -> float:
+    
+    """RDI-Nullmodell fuer Therapien ohne fixe Zyklenzahl (z.B. palliative Regime).
+
+    Anders als :func:`calculate_rdi` gibt es hier kein extern definiertes
+    Plan-Ende (keine geplante Zyklenzahl), gegen das ab- oder ueberschritten
+    werden koennte. Stattdessen wird die real erreichte Dosisintensitaet
+    gegen die Dosisintensitaet verglichen, die dieselbe Anzahl an
+    ``applications`` bei Volldosis (100) und protokollgerechter Taktung
+    (``time_on_treatment_asper_applications``, siehe
+    :func:`applications_to_treatment_days`) ergeben haette. ``applications``
+    und ``time_on_treatment_asper_applications`` uebernehmen damit die Rolle
+    der "Planwerte" -- skaliert auf das, was tatsaechlich verabreicht wurde,
+    statt auf ein fixes Protokoll.
+
+    Bekannte Grenze -- fruehzeitig beendete Komponente einer Kombination:
+    ``time_on_treatment_real`` sollte fuer Medikamente, die erst im Verlauf
+    des Zyklus einsteigen, als :func:`real_time_since_medication_start`
+    uebergeben werden (siehe :func:`parse_application_string`). Das
+    korrigiert aber nur einen *spaeten Start* -- fuer eine Substanz, die
+    innerhalb einer Kombination *frueher aufhoert* als eine andere (z.B. 2
+    Zyklen SEQUENCE, danach noch ein reiner FOLFOX-Bridging-Zyklus ohne
+    Gem/nab-Paclitaxel), gibt es keine aequivalente Korrektur: das eigene
+    Enddatum dieser Substanz ist eine klinische, keine protokollgetriebene
+    Tatsache und wird von ``application_string``/der gemeinsamen
+    ``time_on_treatment_real`` nicht erfasst. Die fruehzeitig beendete
+    Substanz wird dann mit der vollen Regime-Zeit belastet und ihre RDI
+    faellt zu niedrig aus. Siehe :func:`parse_application_string` fuer
+    Details und moegliche Auswege.
+    """
+
+    # 1. Ohne Applikationen ist auch keine Dosisintensitaet erreicht -- und
+    # time_on_treatment_asper_applications waere 0, was Punkt 3 als Nenner
+    # nicht vertraegt.
+    if applications == 0:
+        return 0.0
+
+    # 2. Zeitkorrektur wie in calculate_rdi: eine real kuerzere Spanne als
+    # protokollgerecht (z.B. eine einzelne Applikation mit
+    # time_on_treatment_real=0) darf die RDI nicht ueber avg_dose treiben.
+    relevant_time = max(time_on_treatment_real, time_on_treatment_asper_applications)
+
+    # 3. Dosisintensitaet, die fuer dieselbe Applikationszahl bei Volldosis
+    # und protokollgerechtem Tempo erreichbar gewesen waere.
+    dose_intensity_theoretical = (100 * applications) / time_on_treatment_asper_applications
+
+    # 4. Tatsaechlich erreichte Dosisintensitaet und finale RDI.
+    dose_intensity_real = (avg_dose * applications) / relevant_time
+
+    return round((dose_intensity_real / dose_intensity_theoretical) * 100, 2)
+
+
+def theoretical_applications_table(regime: Regime, total_days_on_therapy: int) -> pd.DataFrame:
+    """
+    Per medication: the applications theoretically achievable at full dose
+    and on-protocol timing, given ``total_days_on_therapy``.
+
+    A thin wrapper around :func:`calculate_applications` over every
+    medication in ``regime``, returned as a DataFrame indexed by medication
+    name (mirrors :func:`parse_application_string`'s indexing) so it can be
+    joined onto its output, e.g. as the theoretical/null-model side of a
+    real-vs-theoretical comparison.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns ``applications_theoretical``, ``avg_dose_theoretical``
+        (always 100 -- full dose is the definition of "theoretical"), and
+        ``last_treatment_day_theoretical`` (``NaN`` where 0 applications
+        were theoretically possible, e.g. therapy stopped before a
+        medication added only later in the cycle was ever reached --
+        :func:`calculate_applications` returns ``None`` for this case, which
+        pandas coerces to ``NaN`` once the column is built).
+    """
+
+    rows = []
+
+    for med in regime.meds:
+        n_theoretical, last_day = calculate_applications(
+            med.treatment_days, med.cycle_len, total_days_on_therapy
+        )
+        rows.append({
+            "medication": med.name,
+            "applications_theoretical": n_theoretical,
+            "avg_dose_theoretical": 100,
+            "last_treatment_day_theoretical": last_day,
+        })
+
+    return pd.DataFrame(rows).set_index("medication")
+
+
+def parse_patient_regimen(row: pd.Series, regime_dict: dict) -> tuple[pd.DataFrame | None, pd.Series | None]:
+    """
+    Build the per-medication real-vs-theoretical table for one patient row.
+
+    Composes :func:`calc_total_days_on_therapy`, :func:`validate_chemo_protocol`,
+    :func:`parse_application_string` and :func:`theoretical_applications_table`
+    into the single call site meant to be used inside a per-patient loop.
+
+    Returns
+    -------
+    tuple
+        ``(result, error)`` -- exactly one of the two is not ``None``. On any
+        of the three known failure modes (invalid Erste/Letzte_Gabe dates,
+        an unknown ``Therapieprotokoll_Name``, or an application string that
+        does not validate against the resolved regime) this returns
+        immediately with ``row`` as the error, rather than falling through to
+        later steps that would otherwise run with a stale value left over
+        from a previous call.
+    """
+
+    try:
+        dot = calc_total_days_on_therapy(row)
+    except ValueError:
+        return None, row
+
+    try:
+        prtcol = validate_chemo_protocol(row, regime_dict)
+    except ValueError:
+        return None, row
+
+    regime = regime_dict[prtcol]
+    applied = getattr(row, "Applizierte_Medikamente_Detail")
+
+    try:
+        res_applied = parse_application_string(applied, dot, regime)
+    except ValueError:
+        return None, row
+
+    res_theoretical = theoretical_applications_table(regime, dot)
+
+    return res_applied.join(res_theoretical), None
