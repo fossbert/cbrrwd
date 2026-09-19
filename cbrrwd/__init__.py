@@ -19,6 +19,7 @@ from .pvalues import cut_p, fdr, fisher_test
 from .regimens import (
     Medication,
     Regime,
+    SuspectApplicationCountWarning,
     applications_to_treatment_days,
     calc_total_days_on_therapy,
     calculate_applications,
@@ -54,6 +55,7 @@ __all__ = [
     "calculate_rdi_theoretical",
     "theoretical_applications_table",
     "parse_patient_regimen",
+    "SuspectApplicationCountWarning",
     # linkage
     "find_closest",
     # pvalues

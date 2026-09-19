@@ -12,6 +12,7 @@ to compute :func:`calculate_rdi`.
 
 from __future__ import annotations
 
+import warnings
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Iterable
@@ -35,7 +36,16 @@ __all__ = [
     "calculate_rdi_theoretical",
     "theoretical_applications_table",
     "parse_patient_regimen",
+    "SuspectApplicationCountWarning",
 ]
+
+
+class SuspectApplicationCountWarning(UserWarning):
+    """More applications are on record than protocol-timed dosing could fit
+    into the observed real time span -- raised by :func:`parse_patient_regimen`.
+    Usually a data error (wrong Erste_Gabe_Datum/Letzte_Gabe_Datum or an
+    incorrect cycle count), not a genuinely dose-dense course.
+    """
 
 
 @dataclass(frozen=True)
@@ -457,15 +467,21 @@ def calculate_rdi_theoretical(avg_dose: float,
     ``applications_theoretical`` (mehr Gaben waeren in der Zeit moeglich
     gewesen) und desto niedriger die resultierende RDI.
 
-    RDI > 100% ist moeglich, wenn ``applications > applications_theoretical``
-    -- also mehr Gaben dokumentiert sind, als im beobachteten Zeitraum bei
-    protokollgerechter Taktung ueberhaupt moeglich gewesen waeren. Das wird
-    bewusst nicht gedeckelt: in aller Regel ist das kein echtes dosisdichtes
-    Schema, sondern ein Hinweis auf fehlerhafte Erste_Gabe_Datum/
-    Letzte_Gabe_Datum oder eine falsche Zyklenzahl in den Rohdaten -- ein
-    Deckel wuerde genau dieses Signal verschlucken. Siehe die
-    ``applications_exceed_theoretical``-Spalte in
-    :func:`parse_patient_regimen`'s Ergebnis, die solche Faelle markiert.
+    Gedeckelt bei ``applications`` (RDI <= ``avg_dose``): wenn mehr Gaben
+    dokumentiert sind als im beobachteten Zeitraum bei protokollgerechter
+    Taktung theoretisch moeglich gewesen waeren (``applications >
+    applications_theoretical``), wird ``applications_theoretical`` fuer diese
+    Berechnung auf ``applications`` angehoben -- analog dazu, wie
+    :func:`calculate_rdi` den Plan bei laengerer-als-geplanter Therapie
+    hochskaliert. Ohne diesen Deckel kann schon eine real nur 1 Tag kuerzere
+    Zeitspanne ``applications_theoretical`` um 1 senken und die RDI bei
+    kleinen Gabenzahlen stark verzerren (5 statt 4 theoretisch moegliche
+    Gaben: 100% -> 125%), obwohl real kein relevanter Unterschied vorliegt.
+    Der Deckel aendert nichts an der eigentlichen Ursache -- siehe die
+    ``applications_exceed_theoretical``-Spalte und die Warnung in
+    :func:`parse_patient_regimen`, die solche Faelle weiterhin sichtbar
+    machen (typischerweise fehlerhafte Erste_Gabe_Datum/Letzte_Gabe_Datum
+    oder eine falsche Zyklenzahl in den Rohdaten).
     """
 
     # 1. Ohne reale oder theoretische Applikationen ist keine Dosisintensitaet
@@ -474,9 +490,13 @@ def calculate_rdi_theoretical(avg_dose: float,
     if applications == 0 or applications_theoretical == 0:
         return 0.0
 
-    # 2. Reale vs. theoretisch moegliche kumulative Dosis in derselben Zeit.
+    # 2. Deckel: mehr reale als theoretisch moegliche Gaben duerfen die RDI
+    # nicht ueber avg_dose treiben (siehe Docstring).
+    effective_applications_theoretical = max(applications_theoretical, applications)
+
+    # 3. Reale vs. theoretisch moegliche kumulative Dosis in derselben Zeit.
     dose_real = avg_dose * applications
-    dose_theoretical = avg_dose_theoretical * applications_theoretical
+    dose_theoretical = avg_dose_theoretical * effective_applications_theoretical
 
     return round((dose_real / dose_theoretical) * 100, 2)
 
@@ -546,7 +566,12 @@ def parse_patient_regimen(row: pd.Series, regime_dict: dict) -> tuple[pd.DataFra
         dose-dense course, since it means more applications are on record
         than protocol-timed dosing could have fit into the observed real
         span -- see :func:`calculate_rdi_theoretical`. Filter on it to find
-        rows worth checking before trusting their RDI.
+        rows worth checking before trusting their RDI. Each flagged medication
+        also raises a :class:`SuspectApplicationCountWarning` naming
+        ``row.name`` as the case id (set the row index to your patient id,
+        e.g. via ``df.set_index("case_id")``, before iterating) and the gap
+        in both applications and days, so a bulk run surfaces these
+        immediately instead of relying on someone noticing later.
     """
 
     try:
@@ -571,5 +596,18 @@ def parse_patient_regimen(row: pd.Series, regime_dict: dict) -> tuple[pd.DataFra
 
     result = res_applied.join(res_theoretical)
     result["applications_exceed_theoretical"] = result["applications"] > result["applications_theoretical"]
+
+    for medication, r in result[result["applications_exceed_theoretical"]].iterrows():
+        time_gap = r.time_on_treatment_real - r.time_on_treatment_asper_applications
+        warnings.warn(
+            f"case_id={row.name!r} medication={medication}: {r.applications:.0f} Gaben "
+            f"dokumentiert, aber nur {r.applications_theoretical:.0f} waeren im beobachteten "
+            f"Zeitraum protokollgerecht getaktet moeglich gewesen (reale Zeit "
+            f"{r.time_on_treatment_real:.0f}d vs. {r.time_on_treatment_asper_applications:.0f}d "
+            f"fuer diese Gabenzahl, Differenz {time_gap:+.0f}d) -- "
+            f"Erste_Gabe_Datum/Letzte_Gabe_Datum und Zyklenzahl pruefen.",
+            SuspectApplicationCountWarning,
+            stacklevel=2,
+        )
 
     return result, None

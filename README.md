@@ -20,7 +20,7 @@ pip install -e '.[all,test]'
 
 | Module | Contents |
 | --- | --- |
-| `cbrrwd.regimens` | `Medication`, `Regime`, `validate_meds`, `parse_application_string`, `parse_patient_regimen`, `calculate_applications`, `theoretical_applications_table`, `applications_to_treatment_days`, `determine_treatment_days`, `calc_total_days_on_therapy`, `validate_chemo_protocol`, `med_info`, `unpack_regime`, `calculate_rdi`, `calculate_rdi_theoretical` |
+| `cbrrwd.regimens` | `Medication`, `Regime`, `validate_meds`, `parse_application_string`, `parse_patient_regimen`, `calculate_applications`, `theoretical_applications_table`, `applications_to_treatment_days`, `determine_treatment_days`, `calc_total_days_on_therapy`, `validate_chemo_protocol`, `med_info`, `unpack_regime`, `calculate_rdi`, `calculate_rdi_theoretical`, `SuspectApplicationCountWarning` |
 | `cbrrwd.linkage` | `find_closest` (nearest record by date, per patient) |
 | `cbrrwd.pvalues` | `cut_p`, `fdr`, `fisher_test` |
 | `cbrrwd.rbackend.contingency` | `fisher_exact_rc` (r x c fallback for `fisher_test`) |
@@ -167,12 +167,18 @@ Scenarios for weekly-x3/q28 gemcitabine (day 1, 8, 15 of a 28-day cycle):
 | Day 8 dropped 3x (6 of 9 given), same start/end as full course | 6 | 100 | 70d | 9 | **66.67** |
 | Dose reduced to 80%, applications spread over double the protocol time | 4 | 80 | 56d | 7 | **45.71** |
 
-RDI > 100% is possible (`applications > applications_theoretical`) and is
-deliberately not capped -- in practice this almost always means bad input
-data (wrong Erste_Gabe_Datum/Letzte_Gabe_Datum, or a cycle count that
-doesn't match reality), not a genuinely dose-dense course; capping it would
-hide exactly that signal. `parse_patient_regimen` flags these rows via
-`applications_exceed_theoretical` (see below).
+When `applications > applications_theoretical`, `applications_theoretical` is
+raised to `applications` before the ratio is computed, capping the result at
+`avg_dose` -- without this, a real course just 1 day faster than protocol
+pace can already tip `applications_theoretical` down by 1 at a cycle
+boundary and send RDI to 125% for what is, for all practical purposes, a
+fully compliant course. The cap doesn't hide the underlying gap, though:
+`parse_patient_regimen` still flags every such row via
+`applications_exceed_theoretical` and raises a `SuspectApplicationCountWarning`
+naming the case id and the size of the gap in both applications and days
+(see below) -- a 1-2 day gap is normal rounding noise, a double-digit one
+(as with the FOLFIRINOX case above) is almost always bad Erste_Gabe_Datum/
+Letzte_Gabe_Datum or a wrong cycle count.
 
 ## Medications that start mid-cycle
 
@@ -256,6 +262,17 @@ every medication in that patient's regime in one DataFrame, plus an
 `applications_exceed_theoretical` column (`applications > applications_theoretical`)
 flagging rows worth checking before trusting their RDI -- usually bad input
 data, not a real dose-dense course (see `calculate_rdi_theoretical` above).
+Every flagged row also raises a `SuspectApplicationCountWarning`, naming
+`row.name` as the case id -- which is exactly `pid` above, since `row.name`
+is whatever the DataFrame was indexed by before `.iterrows()`:
+
+```
+SuspectApplicationCountWarning: case_id='PATIENT-007' medication=FU: 5 Gaben
+dokumentiert, aber nur 4 waeren im beobachteten Zeitraum protokollgerecht
+getaktet moeglich gewesen (reale Zeit 54d vs. 56d fuer diese Gabenzahl,
+Differenz -2d) -- Erste_Gabe_Datum/Letzte_Gabe_Datum und Zyklenzahl pruefen.
+```
+
 `errs` collects the original row for every patient that failed validation
 (bad Erste/Letzte Gabe dates, an unknown `Therapieprotokoll_Name`, or an
 application string that doesn't validate against the resolved regime), for

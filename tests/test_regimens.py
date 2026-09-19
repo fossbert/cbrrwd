@@ -4,6 +4,7 @@ import pytest
 
 from cbrrwd.regimens import (
     Medication,
+    SuspectApplicationCountWarning,
     applications_to_treatment_days,
     calc_total_days_on_therapy,
     calculate_applications,
@@ -239,6 +240,24 @@ def test_calculate_rdi_theoretical_fewer_applications_than_theoretical():
     assert rdi == 50.0
 
 
+def test_calculate_rdi_theoretical_caps_when_applications_exceed_theoretical():
+    # a real course that's just 1 day faster than protocol pace can drop
+    # applications_theoretical by 1 (boundary effect) -- e.g. 5 applications
+    # given, only 4 theoretically fit; without a cap this would be 125%
+    rdi = calculate_rdi_theoretical(
+        avg_dose=100, applications=5,
+        avg_dose_theoretical=100, applications_theoretical=4,
+    )
+    assert rdi == 100.0
+
+    # the cap tracks avg_dose, it doesn't just clip at 100
+    rdi_reduced_dose = calculate_rdi_theoretical(
+        avg_dose=80, applications=5,
+        avg_dose_theoretical=100, applications_theoretical=4,
+    )
+    assert rdi_reduced_dose == 80.0
+
+
 def test_calculate_rdi_theoretical_reduced_dose():
     rdi = calculate_rdi_theoretical(
         avg_dose=90, applications=4,
@@ -314,6 +333,20 @@ def test_parse_patient_regimen_flags_applications_exceeding_theoretical(patient_
     assert result.loc["OX", "applications_exceed_theoretical"]
     # DOC matches its theoretical count exactly -- nothing to flag
     assert not result.loc["DOC", "applications_exceed_theoretical"]
+
+
+def test_parse_patient_regimen_warns_on_applications_exceeding_theoretical(patient_row_valid, regime_dict):
+    patient_row_valid.name = "PATIENT-007"
+
+    with pytest.warns(SuspectApplicationCountWarning) as caught:
+        parse_patient_regimen(patient_row_valid, regime_dict)
+
+    # one warning per flagged medication (FU, OX), none for DOC
+    messages = [str(w.message) for w in caught]
+    assert len(messages) == 2
+    assert all("PATIENT-007" in m for m in messages)
+    assert any("medication=FU" in m for m in messages)
+    assert any("medication=OX" in m for m in messages)
 
 
 def test_parse_patient_regimen_bad_dates_returns_row_as_error(patient_row_bad_dates, regime_dict):
