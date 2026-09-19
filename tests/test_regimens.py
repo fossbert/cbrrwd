@@ -4,6 +4,7 @@ import pytest
 
 from cbrrwd.regimens import (
     Medication,
+    applications_to_treatment_days,
     calc_total_days_on_therapy,
     calculate_applications,
     calculate_rdi,
@@ -12,7 +13,6 @@ from cbrrwd.regimens import (
     med_info,
     parse_application_string,
     parse_patient_regimen,
-    real_time_since_medication_start,
     theoretical_applications_table,
     unpack_regime,
     validate_chemo_protocol,
@@ -65,16 +65,19 @@ def test_calculate_applications_zero_before_late_medication_start():
     # FOLFOX added from day 29 of a 42-day cycle: therapy stopped at day 20,
     # well before FOLFOX was ever reached -- used to raise IndexError
     assert calculate_applications([29], 42, 20) == (0, None)
-    # one day too early still counts as 0 applications
-    assert calculate_applications([29], 42, 28) == (0, None)
-    # day 29 itself is reached -> 1 application
+    # elapsed=28 means today IS calendar day 29 (day 1 of therapy == elapsed
+    # 0, see determine_treatment_days) -> FOLFOX's own start day has been
+    # reached, 1 application
+    assert calculate_applications([29], 42, 28) == (1, 28)
     assert calculate_applications([29], 42, 29) == (1, 28)
 
 
 def test_calculate_applications_zero_applications_multi_day_schedule():
-    # a single application (Erste_Gabe == Letzte_Gabe, 0 days elapsed) used to
-    # crash for any schedule not starting on day 1 -- used to raise IndexError
-    assert calculate_applications([1, 8, 15], 21, 0) == (0, None)
+    # Erste_Gabe == Letzte_Gabe (0 days elapsed) means we're on day 1 of
+    # therapy -- if day 1 is itself a treatment day, that first application
+    # is credited; a schedule that doesn't start on day 1 still gets 0 and
+    # must not crash (this used to raise IndexError)
+    assert calculate_applications([1, 8, 15], 21, 0) == (1, 0)
     assert calculate_applications([8, 15, 22], 28, 0) == (0, None)
 
 
@@ -82,6 +85,41 @@ def test_calculate_applications_zero_applications_single_day_not_day_one():
     # even the existing single-day special case only rescues day-1 schedules
     # -- used to raise IndexError
     assert calculate_applications([15], 30, 0) == (0, None)
+
+
+def test_calculate_applications_full_compliance_multi_day_schedule():
+    # regression test for a real off-by-one: a fully compliant patient on
+    # [1, 8, 15]/q28 (3 cycles = 9 applications) has calc_total_days_on_therapy
+    # == 70 (Erste_Gabe to Letzte_Gabe, day 1 == elapsed 0); this must count
+    # all 9 applications, not 8 -- see determine_treatment_days
+    assert calculate_applications([1, 8, 15], 28, 70) == (9, 70)
+
+
+@pytest.mark.parametrize("treatment_days, cycle_len_days", [
+    ([1], 14),                      # single-day, e.g. FLOT's FU/OX/DOC
+    ([1, 8], 21),                   # Gem/Cis
+    ([1, 8, 15], 28),               # Gem/nab-Paclitaxel (GNP)
+    ([1, 8, 15, 22, 29, 36], 49),   # PLF -- FU
+    ([1, 15, 29], 49),              # PLF -- CIS
+    ([29], 42),                     # medication added later in the cycle
+], ids=["FLOT", "GEMCIS", "GNP", "PLF-FU", "PLF-CIS", "late-start"])
+def test_applications_to_treatment_days_roundtrips_with_calculate_applications(treatment_days, cycle_len_days):
+    # applications_to_treatment_days (n -> elapsed day of the n-th dose) and
+    # calculate_applications (elapsed day -> applications so far) must be
+    # exact inverses of each other across regimes -- both walk the same
+    # elapsed-days/day-in-therapy convention (see determine_treatment_days).
+    # A mismatch here means a patient's real applications_theoretical count
+    # would be wrong at exactly the boundary that matters most: full or
+    # near-full compliance.
+    for n in range(1, 30):
+        elapsed = applications_to_treatment_days(treatment_days, cycle_len_days, n)
+
+        applications_at, last_day_at = calculate_applications(treatment_days, cycle_len_days, elapsed)
+        assert (applications_at, last_day_at) == (n, elapsed)
+
+        if elapsed > 0:
+            applications_before, _ = calculate_applications(treatment_days, cycle_len_days, elapsed - 1)
+            assert applications_before < n
 
 
 def test_validate_meds_required_and_optional(plf_regime):
@@ -179,20 +217,24 @@ def test_calculate_rdi_longer_than_planned_caps_at_full_intensity():
     assert rdi == 100.0
 
 
-def test_calculate_rdi_theoretical_on_schedule():
-    # applications delivered exactly as fast as the protocol allows -> RDI == avg_dose
+def test_calculate_rdi_theoretical_full_compliance():
+    # every application that was theoretically possible in the real elapsed
+    # time was actually given, at full dose -> RDI == 100
     rdi = calculate_rdi_theoretical(
         avg_dose=100, applications=4,
-        time_on_treatment_real=43, time_on_treatment_asper_applications=43,
+        avg_dose_theoretical=100, applications_theoretical=4,
     )
     assert rdi == 100.0
 
 
-def test_calculate_rdi_theoretical_delayed_applications():
-    # same 4 applications, but real time span is longer than protocol-minimum -> RDI drops
+def test_calculate_rdi_theoretical_fewer_applications_than_theoretical():
+    # only half of what was theoretically achievable in the real elapsed
+    # time was given -- whether that's due to genuine delay or to
+    # structurally dropped within-cycle days doesn't matter here, both
+    # collapse to the same applications ratio
     rdi = calculate_rdi_theoretical(
         avg_dose=100, applications=4,
-        time_on_treatment_real=86, time_on_treatment_asper_applications=43,
+        avg_dose_theoretical=100, applications_theoretical=8,
     )
     assert rdi == 50.0
 
@@ -200,18 +242,15 @@ def test_calculate_rdi_theoretical_delayed_applications():
 def test_calculate_rdi_theoretical_reduced_dose():
     rdi = calculate_rdi_theoretical(
         avg_dose=90, applications=4,
-        time_on_treatment_real=43, time_on_treatment_asper_applications=43,
+        avg_dose_theoretical=100, applications_theoretical=4,
     )
     assert rdi == 90.0
 
 
-def test_calculate_rdi_theoretical_single_application_no_elapsed_time():
-    # a single application (e.g. therapy stopped right after it) has
-    # time_on_treatment_real == 0 by construction (first == last date);
-    # this must not raise and must not exceed avg_dose
+def test_calculate_rdi_theoretical_single_application():
     rdi = calculate_rdi_theoretical(
         avg_dose=100, applications=1,
-        time_on_treatment_real=0, time_on_treatment_asper_applications=1,
+        avg_dose_theoretical=100, applications_theoretical=1,
     )
     assert rdi == 100.0
 
@@ -219,60 +258,19 @@ def test_calculate_rdi_theoretical_single_application_no_elapsed_time():
 def test_calculate_rdi_theoretical_no_applications():
     rdi = calculate_rdi_theoretical(
         avg_dose=0, applications=0,
-        time_on_treatment_real=0, time_on_treatment_asper_applications=0,
+        avg_dose_theoretical=100, applications_theoretical=9,
     )
     assert rdi == 0.0
 
 
-def test_real_time_since_medication_start_day_one_is_unaffected():
-    # a medication starting on day 1 of the cycle needs no re-anchoring
-    assert real_time_since_medication_start(60, [1]) == 60
-    assert real_time_since_medication_start(60, [1, 8, 15]) == 60
-
-
-def test_real_time_since_medication_start_shifts_late_starting_medication():
-    # FOLFOX added from day 29: 28 days of the regimen elapse before it
-    # could even start
-    assert real_time_since_medication_start(83, [29]) == 55
-    assert real_time_since_medication_start(29, [29]) == 1
-
-
-def test_real_time_since_medication_start_clips_at_zero():
-    # therapy stopped before this medication's own start day was ever reached
-    assert real_time_since_medication_start(20, [29]) == 0
-
-
-def test_parse_application_string_late_starting_medication(sequence_like_regime):
-    # 2 FOLFOX cycles given on time (day 29 and day 71) within an 83-day
-    # regimen -- FOLFOX's "own" elapsed time excludes the 28 days before it
-    # could start, GEM's does not (it starts on day 1)
-    applied = "GEM-6x100_FU-2x100_OX-2x100"
-
-    res = parse_application_string(applied, time_on_treatment_real=83, regime=sequence_like_regime)
-
-    assert res.loc["GEM", "time_on_treatment_real_since_start"] == 83
-    assert res.loc["FU", "time_on_treatment_real_since_start"] == 55
-    assert res.loc["OX", "time_on_treatment_real_since_start"] == 55
-
-
-def test_calculate_rdi_theoretical_late_starting_medication_needs_since_start(sequence_like_regime):
-    # using the raw, regimen-wide time_on_treatment_real for FOLFOX understates
-    # its RDI, penalizing it for the 28 days before it could even start
-    applied = "GEM-6x100_FU-2x100_OX-2x100"
-    res = parse_application_string(applied, time_on_treatment_real=83, regime=sequence_like_regime)
-    fu = res.loc["FU"]
-
-    rdi_correct = calculate_rdi_theoretical(
-        fu.avg_dose, fu.applications,
-        fu.time_on_treatment_real_since_start, fu.time_on_treatment_asper_applications,
+def test_calculate_rdi_theoretical_no_theoretical_applications_possible():
+    # elapsed time too short for even one theoretical application -- must
+    # not raise ZeroDivisionError
+    rdi = calculate_rdi_theoretical(
+        avg_dose=100, applications=1,
+        avg_dose_theoretical=100, applications_theoretical=0,
     )
-    rdi_using_raw_real_time = calculate_rdi_theoretical(
-        fu.avg_dose, fu.applications,
-        fu.time_on_treatment_real, fu.time_on_treatment_asper_applications,
-    )
-
-    assert rdi_correct == 100.0
-    assert rdi_using_raw_real_time < rdi_correct
+    assert rdi == 0.0
 
 
 def test_theoretical_applications_table(flot_regime):

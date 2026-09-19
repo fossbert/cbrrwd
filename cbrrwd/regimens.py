@@ -26,7 +26,6 @@ __all__ = [
     "parse_application_string",
     "calculate_applications",
     "applications_to_treatment_days",
-    "real_time_since_medication_start",
     "determine_treatment_days",
     "calc_total_days_on_therapy",
     "validate_chemo_protocol",
@@ -136,41 +135,22 @@ def parse_application_string(application_string: str, time_on_treatment_real: in
     was not given).
 
     ``time_on_treatment_real`` in the result is the regimen-wide real span
-    (Erste_Gabe to Letzte_Gabe, anchored to day 1 of the whole regimen) --
-    correct for reporting, but the wrong reference frame for a medication
-    that only enters the regimen partway through a cycle (e.g. FOLFOX added
-    from day 29 of a 42-day Gem/nab-paclitaxel cycle, as in the SEQUENCE
-    regimen). ``time_on_treatment_real_since_start`` is that same span
-    re-anchored to this medication's own first possible treatment day (see
-    :func:`real_time_since_medication_start`); it is what
-    :func:`calculate_rdi`/:func:`calculate_rdi_theoretical` should be fed as
-    their ``time_on_treatment_real`` argument. For a medication starting on
-    day 1 of the cycle (the common case) the two are identical.
-
-    Known limitation -- early-stopping component of a combo: the re-anchoring
-    only corrects for a *late start*, because a medication's own first
-    possible day is a structural fact of the protocol (independent of what
-    actually happened). There is no equivalent correction for a medication
-    that *stops early* while another component of the same combo continues
-    (e.g. 2 cycles of Gem/nab-paclitaxel + FOLFOX per SEQUENCE, then a 3rd
-    cycle of FOLFOX alone as bridging): the *when* a component's own last
-    dose was given is a clinical fact, not derivable from the schedule, and
-    is not captured anywhere in ``application_string`` or the single, shared
-    ``time_on_treatment_real`` for the whole regimen. In that situation the
-    component that stopped early is still charged with the full regimen-wide
-    real time, which understates its RDI. Fixing this properly needs
-    medication-specific first/last-application dates, or the therapy course
-    split into separate segments per regime/protocol change -- each parsed
-    with its own :func:`parse_application_string` call and its own
-    ``time_on_treatment_real`` -- rather than one combined call across a
-    regimen switch.
+    (Erste_Gabe to Letzte_Gabe), shared as-is by every medication in the
+    regime -- including one that only enters partway through a cycle (e.g.
+    FOLFOX added from day 29 of a 42-day Gem/nab-paclitaxel cycle, as in the
+    SEQUENCE regimen) or that stops early while another component continues.
+    Neither case is corrected for here: a medication with a staggered start
+    or end is charged with the full regimen-wide real time, which
+    understates its RDI. Combos with genuinely staggered components are
+    better modeled as separate regime lines with their own
+    Erste_Gabe/Letzte_Gabe, each parsed with its own
+    :func:`parse_application_string` call -- see :func:`parse_patient_regimen`.
 
     Returns
     -------
     pd.DataFrame
         Indexed by medication name, with columns ``applications``,
-        ``avg_dose``, ``time_on_treatment_real``,
-        ``time_on_treatment_real_since_start`` and
+        ``avg_dose``, ``time_on_treatment_real`` and
         ``time_on_treatment_asper_applications``.
     """
 
@@ -181,9 +161,6 @@ def parse_application_string(application_string: str, time_on_treatment_real: in
                 "applications": np.nan,
                 "avg_dose": np.nan,
                 "time_on_treatment_real": time_on_treatment_real,
-                "time_on_treatment_real_since_start": real_time_since_medication_start(
-                    time_on_treatment_real, med_obj.treatment_days
-                ),
                 "time_on_treatment_asper_applications": np.nan,
             }
             for med_obj in regime.meds
@@ -229,10 +206,6 @@ def parse_application_string(application_string: str, time_on_treatment_real: in
 
         med_treatment_days = treatment_days_dict.get(med)
 
-        time_on_treatment_real_since_start = real_time_since_medication_start(
-            time_on_treatment_real, med_treatment_days
-        )
-
         time_on_treatment_asper_applications = applications_to_treatment_days(
             med_treatment_days,
             cycle_len_days_dict.get(med),
@@ -244,7 +217,6 @@ def parse_application_string(application_string: str, time_on_treatment_real: in
             "applications": n_applications,
             "avg_dose": avg_dose,
             "time_on_treatment_real": time_on_treatment_real,
-            "time_on_treatment_real_since_start": time_on_treatment_real_since_start,
             "time_on_treatment_asper_applications": time_on_treatment_asper_applications,
         })
 
@@ -256,9 +228,9 @@ def calculate_applications(treatment_days: list, cycle_len_days: int, total_days
     Calculate the number of treatment applications and the final treatment day.
 
     This helper converts a per-cycle treatment schedule into actual application
-    counts over the observed total days on therapy. It adjusts single-day
-    treatment protocols when the total therapy duration is an exact multiple of
-    the cycle length so that the last cycle application is still counted.
+    counts over the observed total days on therapy (see
+    :func:`determine_treatment_days` for the elapsed-day/day-number convention
+    this relies on).
 
     Parameters
     ----------
@@ -281,21 +253,15 @@ def calculate_applications(treatment_days: list, cycle_len_days: int, total_days
 
     treatment_days = np.array(treatment_days)
 
-    if len(treatment_days) == 1 and (total_days_on_therapy % cycle_len_days == 0):
-
-        # For protocols that repeat every 14 days, for example, we need to add
-        # 1 to count the last application.
-        total_days_on_therapy += 1
-
     treatment_days_array_pruned = determine_treatment_days(treatment_days, cycle_len_days, total_days_on_therapy)
 
     if len(treatment_days_array_pruned) == 0:
         return 0, None
 
-    last_treatment_day = treatment_days_array_pruned[-1]
-
-    if last_treatment_day > 1:
-        last_treatment_day -= 1
+    # treatment_days_array_pruned holds 1-indexed day-in-therapy numbers (see
+    # determine_treatment_days); convert to the elapsed-days scale used
+    # everywhere else (day 1 -> elapsed 0).
+    last_treatment_day = treatment_days_array_pruned[-1] - 1
 
     return len(treatment_days_array_pruned), last_treatment_day
 
@@ -307,6 +273,12 @@ def applications_to_treatment_days(treatment_days: list[int], cycle_len_days: in
     This helper converts a treatment schedule defined within a single cycle into
     the absolute day index for the requested application number. It assumes that
     treatment repeats every cycle_len_days.
+
+    Returns an *elapsed*-days value (0-indexed: the first possible treatment
+    day is 0 elapsed days), the same convention :func:`calc_total_days_on_therapy`
+    and :func:`determine_treatment_days` use -- the inverse of this function.
+    ``n_applications=1`` on a schedule starting on day 1 therefore returns 0,
+    not 1.
 
     Parameters
     ----------
@@ -331,55 +303,44 @@ def applications_to_treatment_days(treatment_days: list[int], cycle_len_days: in
 
     if number_of_days < 0:  # in case there are 0 applications
         number_of_days = 0
-    elif number_of_days == 0:  # in case there is 1 application, the function ends up at 0, correct this case
-        number_of_days = 1
 
     return number_of_days
-
-
-def real_time_since_medication_start(time_on_treatment_real: int, treatment_days: list[int]) -> int:
-    """
-    Re-anchor a regimen-wide real elapsed time to one medication's own start.
-
-    :func:`applications_to_treatment_days` already counts a medication's own
-    first treatment day as day 0 elapsed (e.g. day 29 of a cycle becomes 28).
-    ``time_on_treatment_real`` (from :func:`calc_total_days_on_therapy`) is
-    anchored to day 1 of the whole regimen instead -- correct for a
-    medication that starts on day 1, but too large for one added only later
-    in the cycle (e.g. FOLFOX added from day 29 of a 42-day
-    Gem/nab-paclitaxel cycle, as in the SEQUENCE regimen). Comparing the two
-    directly would compare different reference frames.
-
-    Time elapsed before this medication's own first possible day is not
-    attributable to it, so it is subtracted here. A medication that has not
-    yet reached its own start day gets 0, never a negative number.
-    """
-
-    offset = min(treatment_days) - 1
-    return max(0, time_on_treatment_real - offset)
 
 
 def determine_treatment_days(treatment_days: np.ndarray, cycle_len_days: int, total_days_on_therapy: int) -> np.ndarray:
     """
     Return every treatment day across repeated cycles up to total_days_on_therapy (inclusive).
 
+    ``treatment_days`` (and the values this function returns) are 1-indexed
+    calendar-day-in-therapy numbers -- day 1 is the first possible treatment
+    day. ``total_days_on_therapy``, by contrast, is *elapsed* days since the
+    first dose (0-indexed: the first dose day itself is 0 elapsed days,
+    matching :func:`calc_total_days_on_therapy` and the day/elapsed
+    convention :func:`applications_to_treatment_days` uses in the opposite
+    direction). Calendar day ``d`` is reached once elapsed time has caught up
+    to it, i.e. once ``total_days_on_therapy >= d - 1`` -- equivalently,
+    ``d <= total_days_on_therapy + 1``, which is what the comparisons below
+    use throughout.
+
     ``treatment_days`` is the pattern within one cycle (e.g. [1, 8, 15] for a
     weekly schedule on a 21-day cycle). The pattern is shifted by
     ``k * cycle_len_days`` for k = 0, 1, 2, ... and concatenated, then trimmed
-    at ``total_days_on_therapy``.
+    at ``total_days_on_therapy`` (inclusive, on the elapsed-day scale above).
     """
-    if total_days_on_therapy < treatment_days.min():
+    total_days = total_days_on_therapy + 1  # elapsed days -> 1-indexed day-in-therapy scale
+
+    if total_days < treatment_days.min():
         return treatment_days[:0]  # empty, preserves dtype
 
-    # How many cycle shifts can still produce a day <= total_days_on_therapy?
+    # How many cycle shifts can still produce a day <= total_days?
     # Smallest day in cycle k is treatment_days.min() + k * cycle_len_days,
-    # so k_max = floor((total - min) / cycle_len_days).
-    k_max = (total_days_on_therapy - treatment_days.min()) // cycle_len_days
+    # so k_max = floor((total_days - min) / cycle_len_days).
+    k_max = (total_days - treatment_days.min()) // cycle_len_days
     offsets = np.arange(k_max + 1) * cycle_len_days
 
     all_days = (treatment_days + offsets[:, None]).ravel()
 
-    return all_days[all_days <= total_days_on_therapy]
+    return all_days[all_days <= total_days]
 
 
 def calc_total_days_on_therapy(row: pd.Series, last_date: str = "Letzte_Gabe_Datum", first_date: str = "Erste_Gabe_Datum"):
@@ -471,57 +432,52 @@ def calculate_rdi(avg_dose: float,
 
 def calculate_rdi_theoretical(avg_dose: float,
                                applications: int,
-                               time_on_treatment_real: int,
-                               time_on_treatment_asper_applications: int) -> float:
-    
+                               avg_dose_theoretical: float,
+                               applications_theoretical: int) -> float:
+
     """RDI-Nullmodell fuer Therapien ohne fixe Zyklenzahl (z.B. palliative Regime).
 
     Anders als :func:`calculate_rdi` gibt es hier kein extern definiertes
     Plan-Ende (keine geplante Zyklenzahl), gegen das ab- oder ueberschritten
-    werden koennte. Stattdessen wird die real erreichte Dosisintensitaet
-    gegen die Dosisintensitaet verglichen, die dieselbe Anzahl an
-    ``applications`` bei Volldosis (100) und protokollgerechter Taktung
-    (``time_on_treatment_asper_applications``, siehe
-    :func:`applications_to_treatment_days`) ergeben haette. ``applications``
-    und ``time_on_treatment_asper_applications`` uebernehmen damit die Rolle
-    der "Planwerte" -- skaliert auf das, was tatsaechlich verabreicht wurde,
-    statt auf ein fixes Protokoll.
+    werden koennte. Stattdessen wird die real verabreichte kumulative Dosis
+    (``avg_dose * applications``) gegen die kumulative Dosis verglichen, die
+    bei Volldosis und protokollgerechter Taktung in derselben real
+    verstrichenen Zeit theoretisch moeglich gewesen waere
+    (``avg_dose_theoretical * applications_theoretical``, siehe
+    :func:`theoretical_applications_table`). Die RDI haengt damit rein am
+    Verhaeltnis erhaltener zu theoretisch moeglichen Gaben -- anders als eine
+    reine Zeitverhaeltnis-Rechnung wird kein zusaetzliches "Tempo"-Defizit
+    unterstellt, wenn lediglich einzelne Gaben innerhalb eines ansonsten
+    unveraenderten Zyklus ausgelassen wurden (z.B. Tag 8 bei Gem/nab-Paclitaxel
+    q28[1,8,15]: 6 statt 9 Gaben bei gleichem Start-/Enddatum ergeben 6/9,
+    nicht weniger).
 
-    Bekannte Grenze -- fruehzeitig beendete Komponente einer Kombination:
-    ``time_on_treatment_real`` sollte fuer Medikamente, die erst im Verlauf
-    des Zyklus einsteigen, als :func:`real_time_since_medication_start`
-    uebergeben werden (siehe :func:`parse_application_string`). Das
-    korrigiert aber nur einen *spaeten Start* -- fuer eine Substanz, die
-    innerhalb einer Kombination *frueher aufhoert* als eine andere (z.B. 2
-    Zyklen SEQUENCE, danach noch ein reiner FOLFOX-Bridging-Zyklus ohne
-    Gem/nab-Paclitaxel), gibt es keine aequivalente Korrektur: das eigene
-    Enddatum dieser Substanz ist eine klinische, keine protokollgetriebene
-    Tatsache und wird von ``application_string``/der gemeinsamen
-    ``time_on_treatment_real`` nicht erfasst. Die fruehzeitig beendete
-    Substanz wird dann mit der vollen Regime-Zeit belastet und ihre RDI
-    faellt zu niedrig aus. Siehe :func:`parse_application_string` fuer
-    Details und moegliche Auswege.
+    Ein echter zeitlicher Verzug bleibt trotzdem erfasst: je laenger die reale
+    Therapiedauer bei gleicher Gabenzahl, desto groesser
+    ``applications_theoretical`` (mehr Gaben waeren in der Zeit moeglich
+    gewesen) und desto niedriger die resultierende RDI.
+
+    Bekannte Grenze: Fuer Mehrtages-Schemata kann
+    :func:`calculate_applications`/:func:`determine_treatment_days` an der
+    Zyklusgrenze ein ``applications_theoretical`` liefern, das um 1 zu niedrig
+    ist -- bei voller Compliance kann die RDI dadurch knapp ueber 100%
+    liegen. Bewusst nicht korrigiert (siehe Tests), da Kombinationen mit
+    Medikamenten, die erst im Verlauf des Zyklus einsteigen bzw. frueher
+    enden (z.B. SEQUENCE), ohnehin separat pro Regime-Zeile geparst werden --
+    siehe :func:`parse_patient_regimen`.
     """
 
-    # 1. Ohne Applikationen ist auch keine Dosisintensitaet erreicht -- und
-    # time_on_treatment_asper_applications waere 0, was Punkt 3 als Nenner
-    # nicht vertraegt.
-    if applications == 0:
+    # 1. Ohne reale oder theoretische Applikationen ist keine Dosisintensitaet
+    # definiert -- und applications_theoretical waere 0, was Punkt 2 als
+    # Nenner nicht vertraegt.
+    if applications == 0 or applications_theoretical == 0:
         return 0.0
 
-    # 2. Zeitkorrektur wie in calculate_rdi: eine real kuerzere Spanne als
-    # protokollgerecht (z.B. eine einzelne Applikation mit
-    # time_on_treatment_real=0) darf die RDI nicht ueber avg_dose treiben.
-    relevant_time = max(time_on_treatment_real, time_on_treatment_asper_applications)
+    # 2. Reale vs. theoretisch moegliche kumulative Dosis in derselben Zeit.
+    dose_real = avg_dose * applications
+    dose_theoretical = avg_dose_theoretical * applications_theoretical
 
-    # 3. Dosisintensitaet, die fuer dieselbe Applikationszahl bei Volldosis
-    # und protokollgerechtem Tempo erreichbar gewesen waere.
-    dose_intensity_theoretical = (100 * applications) / time_on_treatment_asper_applications
-
-    # 4. Tatsaechlich erreichte Dosisintensitaet und finale RDI.
-    dose_intensity_real = (avg_dose * applications) / relevant_time
-
-    return round((dose_intensity_real / dose_intensity_theoretical) * 100, 2)
+    return round((dose_real / dose_theoretical) * 100, 2)
 
 
 def theoretical_applications_table(regime: Regime, total_days_on_therapy: int) -> pd.DataFrame:

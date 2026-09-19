@@ -20,7 +20,7 @@ pip install -e '.[all,test]'
 
 | Module | Contents |
 | --- | --- |
-| `cbrrwd.regimens` | `Medication`, `Regime`, `validate_meds`, `parse_application_string`, `parse_patient_regimen`, `calculate_applications`, `theoretical_applications_table`, `applications_to_treatment_days`, `real_time_since_medication_start`, `determine_treatment_days`, `calc_total_days_on_therapy`, `validate_chemo_protocol`, `med_info`, `unpack_regime`, `calculate_rdi`, `calculate_rdi_theoretical` |
+| `cbrrwd.regimens` | `Medication`, `Regime`, `validate_meds`, `parse_application_string`, `parse_patient_regimen`, `calculate_applications`, `theoretical_applications_table`, `applications_to_treatment_days`, `determine_treatment_days`, `calc_total_days_on_therapy`, `validate_chemo_protocol`, `med_info`, `unpack_regime`, `calculate_rdi`, `calculate_rdi_theoretical` |
 | `cbrrwd.linkage` | `find_closest` (nearest record by date, per patient) |
 | `cbrrwd.pvalues` | `cut_p`, `fdr`, `fisher_test` |
 | `cbrrwd.rbackend.contingency` | `fisher_exact_rc` (r x c fallback for `fisher_test`) |
@@ -75,21 +75,19 @@ applied = rwd.parse_application_string(row.Applizierte_Medikamente_Detail, dot, 
 `applied` is indexed by medication name, with one row each:
 
 ```
-            applications  avg_dose  time_on_treatment_real  time_on_treatment_real_since_start  time_on_treatment_asper_applications
+            applications   avg_dose  time_on_treatment_real  time_on_treatment_asper_applications
 medication
-FU                     4     100.0                       42                                  42                                     42
-OX                     4     100.0                       42                                  42                                     42
-DOC                    4     100.0                       42                                  42                                     42
+FU                     6  93.333333                      42                                    70
+OX                     6  93.333333                      42                                    70
+DOC                    4  90.000000                      42                                    42
 ```
 
 - `applications` / `avg_dose` -- how many doses were given, and their average
   relative dose (%).
 - `time_on_treatment_real` -- the regimen-wide real span (Erste_Gabe to
-  Letzte_Gabe), the same for every medication in the row.
-- `time_on_treatment_real_since_start` -- that span re-anchored to *this*
-  medication's own first possible treatment day (see "Medications that start
-  mid-cycle" below). Identical to `time_on_treatment_real` for a medication
-  starting on day 1 of the cycle, which is the common case.
+  Letzte_Gabe), the same for every medication in the row. For a medication
+  that starts partway through the regimen (see below) this is still the
+  whole-regimen span, not re-anchored to that medication's own start.
 - `time_on_treatment_asper_applications` -- the calendar day the observed
   number of applications implies under protocol timing (`applications_to_treatment_days`).
 
@@ -139,101 +137,49 @@ Four scenarios against the same 4-cycle FLOT plan (`applications_planned=4`,
 Palliative therapy is different: there is no pre-specified number of cycles
 to compare against -- treatment simply continues until it stops working or
 becomes intolerable. `calculate_rdi_theoretical` uses a null model instead of
-a plan: it compares the real dose intensity against the dose intensity that
-the *same number of applications* would have achieved at full dose (100%) and
-strictly on-protocol timing. `applications` and
-`time_on_treatment_asper_applications` take over the role `calculate_rdi`'s
-plan arguments play, scaled to what was actually given rather than to a
-fixed protocol.
+a plan: it compares the real cumulative dose given against the cumulative
+dose that full-dose, on-protocol timing would have achieved *in the same
+real elapsed time* (`applications_theoretical`, from
+`theoretical_applications_table` below) -- i.e. it's a pure ratio of doses
+given vs. doses theoretically possible, with no separate time-based penalty.
 
 ```python
 GEM = rwd.Medication("GEM", treatment_days=[1, 8, 15], cycle_len=28)
 gem_regime = rwd.Regime("GEM", GEM)
 
 applied = rwd.parse_application_string("GEM-9x100", time_on_treatment_real=70, regime=gem_regime)
-row = applied.loc["GEM"]
+theoretical = rwd.theoretical_applications_table(gem_regime, total_days_on_therapy=70)
+row = applied.join(theoretical).loc["GEM"]
 
 rdi = rwd.calculate_rdi_theoretical(
     row.avg_dose, row.applications,
-    row.time_on_treatment_real_since_start, row.time_on_treatment_asper_applications,
+    row.avg_dose_theoretical, row.applications_theoretical,
 )
 ```
 
-Four scenarios for weekly-x3/q28 gemcitabine (day 1, 8, 15 of a 28-day cycle,
-i.e. 9 applications per protocol in 70 days):
+Scenarios for weekly-x3/q28 gemcitabine (day 1, 8, 15 of a 28-day cycle):
 
-| Scenario | applications | avg_dose | real time | RDI |
-| --- | --- | --- | --- | --- |
-| 9 applications, exactly on the day1/8/15 q28 schedule | 9 | 100 | 70d | **100.0** |
-| Same 9 applications, but given every 2 weeks instead | 9 | 100 | 112d | **62.5** |
-| Stopped after 2 applications, both on time | 2 | 100 | 7d | **100.0** |
-| Dose reduced to 80%, applications spread over double the protocol time | 4 | 80 | 56d | **40.0** |
+| Scenario | applications | avg_dose | real time | applications_theoretical | RDI |
+| --- | --- | --- | --- | --- | --- |
+| 9 applications, exactly on the day1/8/15 q28 schedule | 9 | 100 | 70d | 9 | **100.0** |
+| Same 9 applications, but given every 2 weeks instead | 9 | 100 | 112d | 13 | **69.23** |
+| Stopped after 2 applications, both on time | 2 | 100 | 7d | 2 | **100.0** |
+| Day 8 dropped 3x (6 of 9 given), same start/end as full course | 6 | 100 | 70d | 9 | **66.67** |
+| Dose reduced to 80%, applications spread over double the protocol time | 4 | 80 | 56d | 7 | **45.71** |
 
-Note on the "every 2 weeks" row: a back-of-envelope rate comparison
-(1 dose / 14 days vs. 3 doses / 28 days) suggests a 33% reduction (66.7%),
-not the 37.5% (62.5%) the function returns. The difference is a real
-boundary effect, not a bug: `time_on_treatment_asper_applications` measures
-the *span* from the first to the last of the 9 applications, not a sustained
-steady-state rate, so at a small application count the "missing" interval
-after the very last dose matters proportionally more. The two converge as
-the application count grows.
+## Medications that start mid-cycle
 
-## Medications that start mid-cycle: `real_time_since_medication_start`
-
-Occasionally one component of a combination starts later than day 1 -- e.g.
-FOLFOX (5-FU + oxaliplatin) added only from day 29 of a 42-day
-Gem/nab-paclitaxel cycle, as in the SEQUENCE regimen for pancreatic ductal
-adenocarcinoma:
-
-```python
-GEM = rwd.Medication("GEM", [1, 8, 15], 42)
-FU  = rwd.Medication("FU",  [29],       42, required=False)
-OX  = rwd.Medication("OX",  [29],       42, required=False)
-sequence = rwd.Regime("SEQUENCE", GEM, FU, OX)
-
-applied = rwd.parse_application_string("GEM-6x100_FU-2x100_OX-2x100", time_on_treatment_real=83, regime=sequence)
-```
-
-```
-            applications  avg_dose  time_on_treatment_real  time_on_treatment_real_since_start  time_on_treatment_asper_applications
-medication
-GEM                    6     100.0                       83                                   83                                     56
-FU                     2     100.0                       83                                   55                                     70
-OX                     2     100.0                       83                                   55                                     70
-```
-
-FOLFOX could not possibly start before day 29, so 28 of the 83 real days are
-not attributable to it -- `time_on_treatment_real_since_start` correctly
-shows 55, not 83. Feeding the raw `time_on_treatment_real` into
-`calculate_rdi_theoretical` instead would understate FOLFOX's RDI, charging
-it for time it was never eligible to use:
-
-```python
-rwd.calculate_rdi_theoretical(100, 2, 55, 70)   # correct: 100.0
-rwd.calculate_rdi_theoretical(100, 2, 83, 70)   # wrong:    84.34 -- penalized for 28 days it never had
-```
-
-Always pass `time_on_treatment_real_since_start` (not `time_on_treatment_real`)
-into `calculate_rdi`/`calculate_rdi_theoretical`; for a medication starting
-on day 1 of the cycle the two columns are identical, so this is safe to do
-unconditionally.
-
-**Known limitation.** This re-anchoring only corrects for a *late start*,
-because a medication's own first possible day is a structural fact of the
-protocol, independent of what actually happened. There is no equivalent
-correction for a medication that *stops early* while another component of
-the same combination continues -- e.g. 2 cycles of Gem/nab-paclitaxel +
-FOLFOX per SEQUENCE, then a 3rd cycle of FOLFOX alone as bridging. *When*
-Gem/nab-paclitaxel's own last dose was given is a clinical fact, not
-derivable from the schedule, and it is not captured anywhere in
-`application_string` or the single, shared `time_on_treatment_real` for the
-whole regimen. The component that stopped early is still charged with the
-full regimen-wide real time, understating its RDI. Fixing this properly
-needs medication-specific first/last-application dates, or the therapy
-course split into separate segments per regimen/protocol change -- each
-parsed with its own `parse_application_string` call and its own
-`time_on_treatment_real` -- rather than one combined call across a regimen
-switch.
+A component of a combination can start later than day 1 -- e.g. FOLFOX
+(5-FU + oxaliplatin) added only from day 29 of a 42-day Gem/nab-paclitaxel
+cycle, as in the SEQUENCE regimen for pancreatic ductal adenocarcinoma
+(`treatment_days=[29]`, see `Regime`/`Medication` above). `parse_application_string`
+does not re-anchor `time_on_treatment_real` to such a medication's own start,
+so it gets charged with the full regimen-wide real time, which understates
+its RDI. The robust fix is to not model this as one combined regime at all:
+split the patient's course into separate segments at the point the protocol
+changed (e.g. `GNP_SEQUENCE` and `FOLFOX_SEQUENCE` as two rows with their own
+Erste_Gabe/Letzte_Gabe), each parsed with its own `parse_patient_regimen`
+call -- see the note on `case_id` uniqueness below.
 
 ## What was theoretically achievable: `calculate_applications` / `theoretical_applications_table`
 
@@ -260,6 +206,11 @@ rwd.calculate_applications([29], 42, 20)   # (0, None) -- day 29 never reached
 output so the two can be `.join()`ed:
 
 ```python
+sequence = rwd.Regime("SEQUENCE",
+    rwd.Medication("GEM", [1, 8, 15], 42),
+    rwd.Medication("FU",  [29],       42, required=False),
+    rwd.Medication("OX",  [29],       42, required=False),
+)
 rwd.theoretical_applications_table(sequence, total_days_on_therapy=20)
 ```
 
@@ -298,6 +249,11 @@ every medication in that patient's regime in one DataFrame. `errs` collects
 the original row for every patient that failed validation (bad Erste/Letzte
 Gabe dates, an unknown `Therapieprotokoll_Name`, or an application string
 that doesn't validate against the resolved regime), for review.
+
+`case_id` must be unique per row: a patient whose regime changed mid-course
+(see above) needs one row per segment, each with its own
+Erste_Gabe/Letzte_Gabe -- otherwise the later row silently overwrites the
+earlier one in `res`.
 
 ## Other modules
 
