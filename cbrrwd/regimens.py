@@ -457,14 +457,15 @@ def calculate_rdi_theoretical(avg_dose: float,
     ``applications_theoretical`` (mehr Gaben waeren in der Zeit moeglich
     gewesen) und desto niedriger die resultierende RDI.
 
-    Bekannte Grenze: Fuer Mehrtages-Schemata kann
-    :func:`calculate_applications`/:func:`determine_treatment_days` an der
-    Zyklusgrenze ein ``applications_theoretical`` liefern, das um 1 zu niedrig
-    ist -- bei voller Compliance kann die RDI dadurch knapp ueber 100%
-    liegen. Bewusst nicht korrigiert (siehe Tests), da Kombinationen mit
-    Medikamenten, die erst im Verlauf des Zyklus einsteigen bzw. frueher
-    enden (z.B. SEQUENCE), ohnehin separat pro Regime-Zeile geparst werden --
-    siehe :func:`parse_patient_regimen`.
+    RDI > 100% ist moeglich, wenn ``applications > applications_theoretical``
+    -- also mehr Gaben dokumentiert sind, als im beobachteten Zeitraum bei
+    protokollgerechter Taktung ueberhaupt moeglich gewesen waeren. Das wird
+    bewusst nicht gedeckelt: in aller Regel ist das kein echtes dosisdichtes
+    Schema, sondern ein Hinweis auf fehlerhafte Erste_Gabe_Datum/
+    Letzte_Gabe_Datum oder eine falsche Zyklenzahl in den Rohdaten -- ein
+    Deckel wuerde genau dieses Signal verschlucken. Siehe die
+    ``applications_exceed_theoretical``-Spalte in
+    :func:`parse_patient_regimen`'s Ergebnis, die solche Faelle markiert.
     """
 
     # 1. Ohne reale oder theoretische Applikationen ist keine Dosisintensitaet
@@ -537,6 +538,15 @@ def parse_patient_regimen(row: pd.Series, regime_dict: dict) -> tuple[pd.DataFra
         immediately with ``row`` as the error, rather than falling through to
         later steps that would otherwise run with a stale value left over
         from a previous call.
+
+        ``result`` carries an extra ``applications_exceed_theoretical``
+        column (``applications > applications_theoretical``): usually a sign
+        of bad input data (wrong Erste_Gabe_Datum/Letzte_Gabe_Datum, or a
+        cycle count that doesn't match reality) rather than a genuinely
+        dose-dense course, since it means more applications are on record
+        than protocol-timed dosing could have fit into the observed real
+        span -- see :func:`calculate_rdi_theoretical`. Filter on it to find
+        rows worth checking before trusting their RDI.
     """
 
     try:
@@ -559,4 +569,7 @@ def parse_patient_regimen(row: pd.Series, regime_dict: dict) -> tuple[pd.DataFra
 
     res_theoretical = theoretical_applications_table(regime, dot)
 
-    return res_applied.join(res_theoretical), None
+    result = res_applied.join(res_theoretical)
+    result["applications_exceed_theoretical"] = result["applications"] > result["applications_theoretical"]
+
+    return result, None

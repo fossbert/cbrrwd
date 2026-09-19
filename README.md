@@ -167,6 +167,13 @@ Scenarios for weekly-x3/q28 gemcitabine (day 1, 8, 15 of a 28-day cycle):
 | Day 8 dropped 3x (6 of 9 given), same start/end as full course | 6 | 100 | 70d | 9 | **66.67** |
 | Dose reduced to 80%, applications spread over double the protocol time | 4 | 80 | 56d | 7 | **45.71** |
 
+RDI > 100% is possible (`applications > applications_theoretical`) and is
+deliberately not capped -- in practice this almost always means bad input
+data (wrong Erste_Gabe_Datum/Letzte_Gabe_Datum, or a cycle count that
+doesn't match reality), not a genuinely dose-dense course; capping it would
+hide exactly that signal. `parse_patient_regimen` flags these rows via
+`applications_exceed_theoretical` (see below).
+
 ## Medications that start mid-cycle
 
 A component of a combination can start later than day 1 -- e.g. FOLFOX
@@ -245,10 +252,14 @@ for pid, row in v1.set_index("case_id").iterrows():
 
 `result` is `parse_application_string`'s output joined with
 `theoretical_applications_table`'s -- the real-vs-theoretical table for
-every medication in that patient's regime in one DataFrame. `errs` collects
-the original row for every patient that failed validation (bad Erste/Letzte
-Gabe dates, an unknown `Therapieprotokoll_Name`, or an application string
-that doesn't validate against the resolved regime), for review.
+every medication in that patient's regime in one DataFrame, plus an
+`applications_exceed_theoretical` column (`applications > applications_theoretical`)
+flagging rows worth checking before trusting their RDI -- usually bad input
+data, not a real dose-dense course (see `calculate_rdi_theoretical` above).
+`errs` collects the original row for every patient that failed validation
+(bad Erste/Letzte Gabe dates, an unknown `Therapieprotokoll_Name`, or an
+application string that doesn't validate against the resolved regime), for
+review.
 
 `case_id` must be unique per row: a patient whose regime changed mid-course
 (see above) needs one row per segment, each with its own

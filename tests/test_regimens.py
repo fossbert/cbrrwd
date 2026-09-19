@@ -303,6 +303,19 @@ def test_parse_patient_regimen_success(patient_row_valid, regime_dict):
     assert result.loc["FU", "applications"] == 6
 
 
+def test_parse_patient_regimen_flags_applications_exceeding_theoretical(patient_row_valid, regime_dict):
+    # patient_row_valid records 6 FU/OX applications in 42 days on a q14
+    # schedule, where only 4 fit protocol timing (see calc above) -- likely
+    # a data error (wrong dates/cycle count), so this must be flagged
+    result, error = parse_patient_regimen(patient_row_valid, regime_dict)
+
+    assert error is None
+    assert result.loc["FU", "applications_exceed_theoretical"]
+    assert result.loc["OX", "applications_exceed_theoretical"]
+    # DOC matches its theoretical count exactly -- nothing to flag
+    assert not result.loc["DOC", "applications_exceed_theoretical"]
+
+
 def test_parse_patient_regimen_bad_dates_returns_row_as_error(patient_row_bad_dates, regime_dict):
     result, error = parse_patient_regimen(patient_row_bad_dates, regime_dict)
 
