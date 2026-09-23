@@ -5,9 +5,12 @@ A :class:`Regime` is a named bundle of :class:`Medication` objects, each with
 its own within-cycle treatment-day pattern and (optionally) a planned number
 of applications. :func:`parse_application_string` takes a compact record of
 what was actually given -- e.g. ``"FU-4x100-2x80_OX-4x100-2x80_DOC-2x100-2x80"``
--- and returns per-medication counts and average relative dose, alongside the
-theoretical (per elapsed days) and planned (per protocol) equivalents needed
-to compute :func:`calculate_rdi`.
+-- and returns per-medication counts and average relative dose;
+:func:`parse_patient_regimen` joins this with the theoretical (per elapsed
+days, :func:`theoretical_applications_table`) and planned (per protocol,
+:func:`planned_applications_table`) equivalents into the one combined table
+that :func:`calculate_rdi`, :func:`calculate_rdi_theoretical` and
+:func:`calculate_rdi_combined` each draw their own inputs from.
 """
 
 from __future__ import annotations
@@ -34,7 +37,9 @@ __all__ = [
     "unpack_regime",
     "calculate_rdi",
     "calculate_rdi_theoretical",
+    "calculate_rdi_combined",
     "theoretical_applications_table",
+    "planned_applications_table",
     "parse_patient_regimen",
     "SuspectApplicationCountWarning",
 ]
@@ -396,17 +401,39 @@ def unpack_regime(regime: Regime, info_key: str):
     return {getattr(med, "name"): med_info(med, info_key) for med in regime.meds}
 
 
-def calculate_rdi(avg_dose: float,
-                   applications: int,
-                   time_on_treatment_real: int,
-                   time_on_treatment_asper_applications: int,
-                   applications_planned: int,
-                   avg_dose_planned: float,
-                   time_on_treatment_planned: int) -> float:
-    
+def calculate_rdi(row: pd.Series,
+                   avg_dose: str = "avg_dose",
+                   applications: str = "applications",
+                   time_on_treatment_real: str = "time_on_treatment_real",
+                   time_on_treatment_asper_applications: str = "time_on_treatment_asper_applications",
+                   applications_planned: str = "applications_planned",
+                   avg_dose_planned: str = "avg_dose_planned",
+                   time_on_treatment_planned: str = "time_on_treatment_planned") -> float:
+
     """Berechnet die reale Dosisintensität (RDI) unter Berücksichtigung von Abbruch, Verzögerung
     und dynamischer Protokoll-Erweiterung bei ungewöhnlich langer Therapiedauer.
+
+    Parameters
+    ----------
+    row : pd.Series
+        One medication's row -- typically a row of :func:`parse_patient_regimen`'s
+        combined output, e.g. applied via ``result.apply(calculate_rdi, axis=1)``.
+    avg_dose, applications, time_on_treatment_real, time_on_treatment_asper_applications,
+    applications_planned, avg_dose_planned, time_on_treatment_planned : str
+        Column names to read the corresponding value from ``row``. The
+        defaults already match :func:`parse_patient_regimen`'s output, so
+        this is "in cbrrwd's own world" from there on and normally needs no
+        overrides -- pass a different name only against a differently
+        labeled table.
     """
+    avg_dose = getattr(row, avg_dose)
+    applications = getattr(row, applications)
+    time_on_treatment_real = getattr(row, time_on_treatment_real)
+    time_on_treatment_asper_applications = getattr(row, time_on_treatment_asper_applications)
+    applications_planned = getattr(row, applications_planned)
+    avg_dose_planned = getattr(row, avg_dose_planned)
+    time_on_treatment_planned = getattr(row, time_on_treatment_planned)
+
     # 1. Fallunterscheidung: Liegt eine ungewöhnlich lange Therapie vor oder wurde abgebrochen?
     longer_than_anticipated = applications > applications_planned
     therapy_canceled = applications < applications_planned
@@ -440,12 +467,23 @@ def calculate_rdi(avg_dose: float,
     return round((dose_intensity_real / dose_intensity_planned) * 100, 2)
 
 
-def calculate_rdi_theoretical(avg_dose: float,
-                               applications: int,
-                               avg_dose_theoretical: float,
-                               applications_theoretical: int) -> float:
+def calculate_rdi_theoretical(row: pd.Series,
+                               avg_dose: str = "avg_dose",
+                               applications: str = "applications",
+                               avg_dose_theoretical: str = "avg_dose_theoretical",
+                               applications_theoretical: str = "applications_theoretical") -> float:
 
     """RDI-Nullmodell fuer Therapien ohne fixe Zyklenzahl (z.B. palliative Regime).
+
+    Parameters
+    ----------
+    row : pd.Series
+        One medication's row -- typically a row of :func:`parse_patient_regimen`'s
+        combined output, e.g. applied via ``result.apply(calculate_rdi_theoretical, axis=1)``.
+    avg_dose, applications, avg_dose_theoretical, applications_theoretical : str
+        Column names to read the corresponding value from ``row``. The
+        defaults already match :func:`parse_patient_regimen`'s output and
+        normally need no overrides.
 
     Anders als :func:`calculate_rdi` gibt es hier kein extern definiertes
     Plan-Ende (keine geplante Zyklenzahl), gegen das ab- oder ueberschritten
@@ -483,6 +521,11 @@ def calculate_rdi_theoretical(avg_dose: float,
     machen (typischerweise fehlerhafte Erste_Gabe_Datum/Letzte_Gabe_Datum
     oder eine falsche Zyklenzahl in den Rohdaten).
     """
+
+    avg_dose = getattr(row, avg_dose)
+    applications = getattr(row, applications)
+    avg_dose_theoretical = getattr(row, avg_dose_theoretical)
+    applications_theoretical = getattr(row, applications_theoretical)
 
     # 1. Ohne reale oder theoretische Applikationen ist keine Dosisintensitaet
     # definiert -- und applications_theoretical waere 0, was Punkt 2 als
@@ -540,13 +583,131 @@ def theoretical_applications_table(regime: Regime, total_days_on_therapy: int) -
     return pd.DataFrame(rows).set_index("medication")
 
 
-def parse_patient_regimen(row: pd.Series, regime_dict: dict) -> tuple[pd.DataFrame | None, pd.Series | None]:
+def planned_applications_table(regime: Regime) -> pd.DataFrame:
     """
-    Build the per-medication real-vs-theoretical table for one patient row.
+    Per medication: what the protocol itself calls for, independent of any
+    observed patient -- the fixed-cycle-count plan side needed by
+    :func:`calculate_rdi`, mirroring how :func:`theoretical_applications_table`
+    provides the open-ended null-model side needed by
+    :func:`calculate_rdi_theoretical`.
+
+    A medication with ``planned_applications=None`` (dosed until progression/
+    toxicity rather than for a fixed number of cycles) gets ``NaN`` in all
+    three columns rather than 0, so it stays distinguishable downstream (e.g.
+    by :func:`calculate_rdi_combined`, which uses exactly this to decide
+    which RDI formula applies).
+
+    Returns
+    -------
+    pd.DataFrame
+        Indexed by medication name, with columns ``applications_planned``,
+        ``avg_dose_planned`` (always 100 where defined -- full dose is the
+        definition of "planned") and ``time_on_treatment_planned`` (the
+        protocol day of the last planned application, via
+        :func:`applications_to_treatment_days`).
+    """
+
+    rows = []
+
+    for med in regime.meds:
+        if med.planned_applications is None:
+            rows.append({
+                "medication": med.name,
+                "applications_planned": np.nan,
+                "avg_dose_planned": np.nan,
+                "time_on_treatment_planned": np.nan,
+            })
+            continue
+
+        time_on_treatment_planned = applications_to_treatment_days(
+            med.treatment_days, med.cycle_len, med.planned_applications
+        )
+        rows.append({
+            "medication": med.name,
+            "applications_planned": med.planned_applications,
+            "avg_dose_planned": 100,
+            "time_on_treatment_planned": time_on_treatment_planned,
+        })
+
+    return pd.DataFrame(rows).set_index("medication")
+
+
+def calculate_rdi_combined(row: pd.Series,
+                            avg_dose: str = "avg_dose",
+                            applications: str = "applications",
+                            time_on_treatment_real: str = "time_on_treatment_real",
+                            time_on_treatment_asper_applications: str = "time_on_treatment_asper_applications",
+                            applications_planned: str = "applications_planned",
+                            avg_dose_planned: str = "avg_dose_planned",
+                            time_on_treatment_planned: str = "time_on_treatment_planned",
+                            avg_dose_theoretical: str = "avg_dose_theoretical",
+                            applications_theoretical: str = "applications_theoretical") -> float:
+    """
+    Compute one medication's RDI from a row of :func:`parse_patient_regimen`'s
+    output, dispatching to :func:`calculate_rdi` when this medication has a
+    fixed-cycle plan (``applications_planned`` not NaN) and to
+    :func:`calculate_rdi_theoretical` otherwise (open-ended dosing, no
+    protocol end to compare against).
+
+    Meant to be applied row-wise over the combined table, e.g.
+    ``result.apply(calculate_rdi_combined, axis=1)`` -- each row already
+    carries both the planned and the theoretical columns, so this is the one
+    place that picks between them per medication; :func:`calculate_rdi` and
+    :func:`calculate_rdi_theoretical` themselves stay untouched. The column
+    name arguments are forwarded to whichever of the two is picked -- override
+    them here (not on the underlying function) if your table renamed a column.
+    """
+
+    if pd.notna(getattr(row, applications_planned)):
+        return calculate_rdi(
+            row,
+            avg_dose=avg_dose,
+            applications=applications,
+            time_on_treatment_real=time_on_treatment_real,
+            time_on_treatment_asper_applications=time_on_treatment_asper_applications,
+            applications_planned=applications_planned,
+            avg_dose_planned=avg_dose_planned,
+            time_on_treatment_planned=time_on_treatment_planned,
+        )
+
+    return calculate_rdi_theoretical(
+        row,
+        avg_dose=avg_dose,
+        applications=applications,
+        avg_dose_theoretical=avg_dose_theoretical,
+        applications_theoretical=applications_theoretical,
+    )
+
+
+def parse_patient_regimen(row: pd.Series, regime_dict: dict, case_id: str = None) -> tuple[pd.DataFrame | None, pd.Series | None]:
+    """
+    Build the per-medication real-vs-plan-vs-theoretical table for one
+    patient row -- the common output both :func:`calculate_rdi` and
+    :func:`calculate_rdi_theoretical` (or the :func:`calculate_rdi_combined`
+    dispatcher) draw their own inputs from, so a mixed regime (some
+    medications on a fixed cycle count, others dosed open-ended) doesn't need
+    two separate parsing passes.
 
     Composes :func:`calc_total_days_on_therapy`, :func:`validate_chemo_protocol`,
-    :func:`parse_application_string` and :func:`theoretical_applications_table`
-    into the single call site meant to be used inside a per-patient loop.
+    :func:`parse_application_string`, :func:`theoretical_applications_table` and
+    :func:`planned_applications_table` into the single call site meant to be
+    used inside a per-patient loop.
+
+    Parameters
+    ----------
+    row : pd.Series
+        One patient's row.
+    regime_dict : dict
+        Maps ``Therapieprotokoll_Name`` values to :class:`Regime` objects.
+    case_id : str, optional
+        Column in ``row`` identifying the patient, used only to label the
+        :class:`SuspectApplicationCountWarning` below. If not given, falls
+        back to ``row.name`` -- which is only meaningful if the input table's
+        index was set to the patient id before iterating (e.g.
+        ``df.set_index("case_id").iterrows()``); a table that instead keeps
+        the id in an ordinary column (e.g. ``"ID"``, with the default
+        RangeIndex left in place) should pass ``case_id="ID"`` so the warning
+        names the actual patient rather than a meaningless row position.
 
     Returns
     -------
@@ -559,19 +720,27 @@ def parse_patient_regimen(row: pd.Series, regime_dict: dict) -> tuple[pd.DataFra
         later steps that would otherwise run with a stale value left over
         from a previous call.
 
-        ``result`` carries an extra ``applications_exceed_theoretical``
-        column (``applications > applications_theoretical``): usually a sign
-        of bad input data (wrong Erste_Gabe_Datum/Letzte_Gabe_Datum, or a
-        cycle count that doesn't match reality) rather than a genuinely
-        dose-dense course, since it means more applications are on record
-        than protocol-timed dosing could have fit into the observed real
-        span -- see :func:`calculate_rdi_theoretical`. Filter on it to find
-        rows worth checking before trusting their RDI. Each flagged medication
-        also raises a :class:`SuspectApplicationCountWarning` naming
-        ``row.name`` as the case id (set the row index to your patient id,
-        e.g. via ``df.set_index("case_id")``, before iterating) and the gap
-        in both applications and days, so a bulk run surfaces these
-        immediately instead of relying on someone noticing later.
+        ``result`` has one row per medication, indexed by name, with the
+        columns of :func:`parse_application_string` (``applications``,
+        ``avg_dose``, ``time_on_treatment_real``,
+        ``time_on_treatment_asper_applications``),
+        :func:`theoretical_applications_table` (``applications_theoretical``,
+        ``avg_dose_theoretical``, ``last_treatment_day_theoretical``) and
+        :func:`planned_applications_table` (``applications_planned``,
+        ``avg_dose_planned``, ``time_on_treatment_planned`` -- ``NaN`` for a
+        medication with no fixed cycle count), plus an extra
+        ``applications_exceed_theoretical`` column
+        (``applications > applications_theoretical``): usually a sign of bad
+        input data (wrong Erste_Gabe_Datum/Letzte_Gabe_Datum, or a cycle
+        count that doesn't match reality) rather than a genuinely dose-dense
+        course, since it means more applications are on record than
+        protocol-timed dosing could have fit into the observed real span --
+        see :func:`calculate_rdi_theoretical`. Filter on it to find rows
+        worth checking before trusting their RDI. Each flagged medication
+        also raises a :class:`SuspectApplicationCountWarning` naming the
+        case id (see the ``case_id`` parameter above) and the gap in both
+        applications and days, so a bulk run surfaces these immediately
+        instead of relying on someone noticing later.
     """
 
     try:
@@ -593,14 +762,17 @@ def parse_patient_regimen(row: pd.Series, regime_dict: dict) -> tuple[pd.DataFra
         return None, row
 
     res_theoretical = theoretical_applications_table(regime, dot)
+    res_planned = planned_applications_table(regime)
 
-    result = res_applied.join(res_theoretical)
+    result = res_applied.join(res_theoretical).join(res_planned)
     result["applications_exceed_theoretical"] = result["applications"] > result["applications_theoretical"]
+
+    case_id_value = getattr(row, case_id) if case_id is not None else row.name
 
     for medication, r in result[result["applications_exceed_theoretical"]].iterrows():
         time_gap = r.time_on_treatment_real - r.time_on_treatment_asper_applications
         warnings.warn(
-            f"case_id={row.name!r} medication={medication}: {r.applications:.0f} Gaben "
+            f"case_id={case_id_value!r} medication={medication}: {r.applications:.0f} Gaben "
             f"dokumentiert, aber nur {r.applications_theoretical:.0f} waeren im beobachteten "
             f"Zeitraum protokollgerecht getaktet moeglich gewesen (reale Zeit "
             f"{r.time_on_treatment_real:.0f}d vs. {r.time_on_treatment_asper_applications:.0f}d "

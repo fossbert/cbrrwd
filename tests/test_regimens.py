@@ -9,11 +9,13 @@ from cbrrwd.regimens import (
     calc_total_days_on_therapy,
     calculate_applications,
     calculate_rdi,
+    calculate_rdi_combined,
     calculate_rdi_theoretical,
     determine_treatment_days,
     med_info,
     parse_application_string,
     parse_patient_regimen,
+    planned_applications_table,
     theoretical_applications_table,
     unpack_regime,
     validate_chemo_protocol,
@@ -183,37 +185,51 @@ def test_unpack_regime(flot_regime):
 
 
 def test_calculate_rdi_on_plan():
-    rdi = calculate_rdi(
-        avg_dose=100, applications=4, time_on_treatment_real=43,
-        time_on_treatment_asper_applications=43, applications_planned=4,
-        avg_dose_planned=100, time_on_treatment_planned=43,
-    )
+    rdi = calculate_rdi(pd.Series({
+        "avg_dose": 100, "applications": 4, "time_on_treatment_real": 43,
+        "time_on_treatment_asper_applications": 43, "applications_planned": 4,
+        "avg_dose_planned": 100, "time_on_treatment_planned": 43,
+    }))
     assert rdi == 100.0
 
 
 def test_calculate_rdi_reduced_dose():
-    rdi = calculate_rdi(
-        avg_dose=90, applications=4, time_on_treatment_real=45,
-        time_on_treatment_asper_applications=43, applications_planned=4,
-        avg_dose_planned=100, time_on_treatment_planned=43,
-    )
+    rdi = calculate_rdi(pd.Series({
+        "avg_dose": 90, "applications": 4, "time_on_treatment_real": 45,
+        "time_on_treatment_asper_applications": 43, "applications_planned": 4,
+        "avg_dose_planned": 100, "time_on_treatment_planned": 43,
+    }))
     assert rdi == 86.0
 
 
 def test_calculate_rdi_therapy_canceled():
-    rdi = calculate_rdi(
-        avg_dose=100, applications=2, time_on_treatment_real=15,
-        time_on_treatment_asper_applications=15, applications_planned=4,
-        avg_dose_planned=100, time_on_treatment_planned=43,
-    )
+    rdi = calculate_rdi(pd.Series({
+        "avg_dose": 100, "applications": 2, "time_on_treatment_real": 15,
+        "time_on_treatment_asper_applications": 15, "applications_planned": 4,
+        "avg_dose_planned": 100, "time_on_treatment_planned": 43,
+    }))
     assert rdi == 50.0
 
 
 def test_calculate_rdi_longer_than_planned_caps_at_full_intensity():
+    rdi = calculate_rdi(pd.Series({
+        "avg_dose": 100, "applications": 6, "time_on_treatment_real": 71,
+        "time_on_treatment_asper_applications": 71, "applications_planned": 4,
+        "avg_dose_planned": 100, "time_on_treatment_planned": 43,
+    }))
+    assert rdi == 100.0
+
+
+def test_calculate_rdi_uses_custom_column_names():
     rdi = calculate_rdi(
-        avg_dose=100, applications=6, time_on_treatment_real=71,
-        time_on_treatment_asper_applications=71, applications_planned=4,
-        avg_dose_planned=100, time_on_treatment_planned=43,
+        pd.Series({
+            "dose": 100, "n": 4, "real_days": 43,
+            "days_asper_n": 43, "n_planned": 4,
+            "dose_planned": 100, "days_planned": 43,
+        }),
+        avg_dose="dose", applications="n", time_on_treatment_real="real_days",
+        time_on_treatment_asper_applications="days_asper_n", applications_planned="n_planned",
+        avg_dose_planned="dose_planned", time_on_treatment_planned="days_planned",
     )
     assert rdi == 100.0
 
@@ -221,10 +237,10 @@ def test_calculate_rdi_longer_than_planned_caps_at_full_intensity():
 def test_calculate_rdi_theoretical_full_compliance():
     # every application that was theoretically possible in the real elapsed
     # time was actually given, at full dose -> RDI == 100
-    rdi = calculate_rdi_theoretical(
-        avg_dose=100, applications=4,
-        avg_dose_theoretical=100, applications_theoretical=4,
-    )
+    rdi = calculate_rdi_theoretical(pd.Series({
+        "avg_dose": 100, "applications": 4,
+        "avg_dose_theoretical": 100, "applications_theoretical": 4,
+    }))
     assert rdi == 100.0
 
 
@@ -233,10 +249,10 @@ def test_calculate_rdi_theoretical_fewer_applications_than_theoretical():
     # time was given -- whether that's due to genuine delay or to
     # structurally dropped within-cycle days doesn't matter here, both
     # collapse to the same applications ratio
-    rdi = calculate_rdi_theoretical(
-        avg_dose=100, applications=4,
-        avg_dose_theoretical=100, applications_theoretical=8,
-    )
+    rdi = calculate_rdi_theoretical(pd.Series({
+        "avg_dose": 100, "applications": 4,
+        "avg_dose_theoretical": 100, "applications_theoretical": 8,
+    }))
     assert rdi == 50.0
 
 
@@ -244,51 +260,51 @@ def test_calculate_rdi_theoretical_caps_when_applications_exceed_theoretical():
     # a real course that's just 1 day faster than protocol pace can drop
     # applications_theoretical by 1 (boundary effect) -- e.g. 5 applications
     # given, only 4 theoretically fit; without a cap this would be 125%
-    rdi = calculate_rdi_theoretical(
-        avg_dose=100, applications=5,
-        avg_dose_theoretical=100, applications_theoretical=4,
-    )
+    rdi = calculate_rdi_theoretical(pd.Series({
+        "avg_dose": 100, "applications": 5,
+        "avg_dose_theoretical": 100, "applications_theoretical": 4,
+    }))
     assert rdi == 100.0
 
     # the cap tracks avg_dose, it doesn't just clip at 100
-    rdi_reduced_dose = calculate_rdi_theoretical(
-        avg_dose=80, applications=5,
-        avg_dose_theoretical=100, applications_theoretical=4,
-    )
+    rdi_reduced_dose = calculate_rdi_theoretical(pd.Series({
+        "avg_dose": 80, "applications": 5,
+        "avg_dose_theoretical": 100, "applications_theoretical": 4,
+    }))
     assert rdi_reduced_dose == 80.0
 
 
 def test_calculate_rdi_theoretical_reduced_dose():
-    rdi = calculate_rdi_theoretical(
-        avg_dose=90, applications=4,
-        avg_dose_theoretical=100, applications_theoretical=4,
-    )
+    rdi = calculate_rdi_theoretical(pd.Series({
+        "avg_dose": 90, "applications": 4,
+        "avg_dose_theoretical": 100, "applications_theoretical": 4,
+    }))
     assert rdi == 90.0
 
 
 def test_calculate_rdi_theoretical_single_application():
-    rdi = calculate_rdi_theoretical(
-        avg_dose=100, applications=1,
-        avg_dose_theoretical=100, applications_theoretical=1,
-    )
+    rdi = calculate_rdi_theoretical(pd.Series({
+        "avg_dose": 100, "applications": 1,
+        "avg_dose_theoretical": 100, "applications_theoretical": 1,
+    }))
     assert rdi == 100.0
 
 
 def test_calculate_rdi_theoretical_no_applications():
-    rdi = calculate_rdi_theoretical(
-        avg_dose=0, applications=0,
-        avg_dose_theoretical=100, applications_theoretical=9,
-    )
+    rdi = calculate_rdi_theoretical(pd.Series({
+        "avg_dose": 0, "applications": 0,
+        "avg_dose_theoretical": 100, "applications_theoretical": 9,
+    }))
     assert rdi == 0.0
 
 
 def test_calculate_rdi_theoretical_no_theoretical_applications_possible():
     # elapsed time too short for even one theoretical application -- must
     # not raise ZeroDivisionError
-    rdi = calculate_rdi_theoretical(
-        avg_dose=100, applications=1,
-        avg_dose_theoretical=100, applications_theoretical=0,
-    )
+    rdi = calculate_rdi_theoretical(pd.Series({
+        "avg_dose": 100, "applications": 1,
+        "avg_dose_theoretical": 100, "applications_theoretical": 0,
+    }))
     assert rdi == 0.0
 
 
@@ -312,6 +328,46 @@ def test_theoretical_applications_table_zero_before_late_start(sequence_like_reg
     assert pd.isna(res.loc["FU", "last_treatment_day_theoretical"])
 
 
+def test_planned_applications_table(flot_regime):
+    res = planned_applications_table(flot_regime)
+
+    assert list(res.index) == ["FU", "OX", "DOC"]
+    assert (res["applications_planned"] == 4).all()
+    assert (res["avg_dose_planned"] == 100).all()
+    assert (res["time_on_treatment_planned"] == 42).all()
+
+
+def test_planned_applications_table_nan_without_fixed_cycle_count(sequence_like_regime):
+    # none of GEM/FU/OX in this regime has planned_applications set (dosed
+    # until progression/toxicity) -- must come back NaN, not 0, so
+    # calculate_rdi_combined can tell "no plan" apart from "0 planned"
+    res = planned_applications_table(sequence_like_regime)
+
+    assert res["applications_planned"].isna().all()
+    assert res["avg_dose_planned"].isna().all()
+    assert res["time_on_treatment_planned"].isna().all()
+
+
+def test_calculate_rdi_combined_uses_plan_when_available():
+    row = pd.Series({
+        "avg_dose": 100, "applications": 4,
+        "time_on_treatment_real": 43, "time_on_treatment_asper_applications": 43,
+        "applications_planned": 4, "avg_dose_planned": 100, "time_on_treatment_planned": 43,
+        "avg_dose_theoretical": 100, "applications_theoretical": 999,  # must be ignored
+    })
+    assert calculate_rdi_combined(row) == 100.0
+
+
+def test_calculate_rdi_combined_falls_back_to_theoretical_without_plan():
+    row = pd.Series({
+        "avg_dose": 100, "applications": 4,
+        "time_on_treatment_real": 28, "time_on_treatment_asper_applications": 28,
+        "applications_planned": np.nan, "avg_dose_planned": np.nan, "time_on_treatment_planned": np.nan,
+        "avg_dose_theoretical": 100, "applications_theoretical": 4,
+    })
+    assert calculate_rdi_combined(row) == 100.0
+
+
 def test_parse_patient_regimen_success(patient_row_valid, regime_dict):
     result, error = parse_patient_regimen(patient_row_valid, regime_dict)
 
@@ -320,6 +376,10 @@ def test_parse_patient_regimen_success(patient_row_valid, regime_dict):
     assert "applications" in result.columns
     assert "applications_theoretical" in result.columns
     assert result.loc["FU", "applications"] == 6
+    # FLOT is fixed-cycle-count (planned_applications=4 on every medication)
+    assert "applications_planned" in result.columns
+    assert result.loc["FU", "applications_planned"] == 4
+    assert result.loc["FU", "time_on_treatment_planned"] == 42
 
 
 def test_parse_patient_regimen_flags_applications_exceeding_theoretical(patient_row_valid, regime_dict):
@@ -347,6 +407,22 @@ def test_parse_patient_regimen_warns_on_applications_exceeding_theoretical(patie
     assert all("PATIENT-007" in m for m in messages)
     assert any("medication=FU" in m for m in messages)
     assert any("medication=OX" in m for m in messages)
+
+
+def test_parse_patient_regimen_warns_using_case_id_column(patient_row_valid, regime_dict):
+    # a raw input table often keeps the patient id in an ordinary column
+    # (e.g. "ID") rather than in the DataFrame index -- row.name would then
+    # just be a meaningless row position, so case_id lets the caller point
+    # at the real identifier instead
+    patient_row_valid["ID"] = "PATIENT-042"
+    patient_row_valid.name = 3  # the meaningless default-RangeIndex position
+
+    with pytest.warns(SuspectApplicationCountWarning) as caught:
+        parse_patient_regimen(patient_row_valid, regime_dict, case_id="ID")
+
+    messages = [str(w.message) for w in caught]
+    assert all("PATIENT-042" in m for m in messages)
+    assert all("case_id=3" not in m for m in messages)
 
 
 def test_parse_patient_regimen_bad_dates_returns_row_as_error(patient_row_bad_dates, regime_dict):

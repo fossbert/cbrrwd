@@ -20,7 +20,7 @@ pip install -e '.[all,test]'
 
 | Module | Contents |
 | --- | --- |
-| `cbrrwd.regimens` | `Medication`, `Regime`, `validate_meds`, `parse_application_string`, `parse_patient_regimen`, `calculate_applications`, `theoretical_applications_table`, `applications_to_treatment_days`, `determine_treatment_days`, `calc_total_days_on_therapy`, `validate_chemo_protocol`, `med_info`, `unpack_regime`, `calculate_rdi`, `calculate_rdi_theoretical`, `SuspectApplicationCountWarning` |
+| `cbrrwd.regimens` | `Medication`, `Regime`, `validate_meds`, `parse_application_string`, `parse_patient_regimen`, `calculate_applications`, `theoretical_applications_table`, `planned_applications_table`, `applications_to_treatment_days`, `determine_treatment_days`, `calc_total_days_on_therapy`, `validate_chemo_protocol`, `med_info`, `unpack_regime`, `calculate_rdi`, `calculate_rdi_theoretical`, `calculate_rdi_combined`, `SuspectApplicationCountWarning` |
 | `cbrrwd.linkage` | `find_closest` (nearest record by date, per patient) |
 | `cbrrwd.pvalues` | `cut_p`, `fdr`, `fisher_test` |
 | `cbrrwd.rbackend.contingency` | `fisher_exact_rc` (r x c fallback for `fisher_test`) |
@@ -64,13 +64,35 @@ segment per medication: `"FU-4x100-2x80_OX-4x100-2x80_DOC-2x100-2x80"` means
 FU was given 4 times at 100% dose, then 2 times at 80%; similarly for OX and
 DOC.
 
+Getting from a raw patient row to that string's regime takes two small
+lookups first:
+
+- `calc_total_days_on_therapy(row)` -- days between `Erste_Gabe_Datum` (first
+  dose) and `Letzte_Gabe_Datum` (last dose); column names are overridable
+  keyword args if your table names them differently. Raises `ValueError` if
+  the last dose precedes the first (a data error, not a valid course).
+- `validate_chemo_protocol(row, regime_dict)` -- looks `row.Therapieprotokoll_Name`
+  up in `regime_dict` and returns it unchanged; raises `ValueError` if that
+  protocol name isn't a key in `regime_dict` (typo, or a protocol not
+  modeled yet).
+
 ```python
-dot = rwd.calc_total_days_on_therapy(row)  # from Erste_Gabe_Datum / Letzte_Gabe_Datum
+dot = rwd.calc_total_days_on_therapy(row)
 protocol = rwd.validate_chemo_protocol(row, regime_dict)
 regime = regime_dict[protocol]
 
 applied = rwd.parse_application_string(row.Applizierte_Medikamente_Detail, dot, regime)
 ```
+
+`parse_application_string` itself first calls `validate_meds` on the string
+against `regime`: every *required* medication must appear with exactly the
+frequency (segment count) the regime expects, an *optional* one may appear
+or not, and any medication that's neither required nor optional fails
+validation -- matching is case-insensitive and segment order doesn't matter.
+A mismatch raises `ValueError`. For each medication present it then sums the
+`NxPercent%` segments into a total application count and a dose-weighted
+average (`avg_dose`), and calls `applications_to_treatment_days` (below) to
+translate that count into the protocol day it would fall on.
 
 `applied` is indexed by medication name, with one row each:
 
@@ -106,20 +128,24 @@ planned (the plan is scaled to the observed application count before
 comparing, so a clinician-extended course isn't penalized for simply having
 more applications).
 
+`calculate_rdi` takes a medication's row and the column names to read its
+inputs from -- the defaults already match what `parse_patient_regimen`
+produces (see below), so once you're inside a row from there you're "in
+cbrrwd's own world" and normally pass nothing but the row itself:
+
 ```python
 appl_planned = rwd.applications_to_treatment_days(
     FU.treatment_days, FU.cycle_len, FU.planned_applications
 )  # protocol day of the 4th (last planned) FU application -> 42
+# (this is exactly what planned_applications_table computes per medication --
+# see "What the protocol calls for" below for the version that does it for you)
 
-rdi = rwd.calculate_rdi(
-    avg_dose=applied.loc["FU", "avg_dose"],
-    applications=applied.loc["FU", "applications"],
-    time_on_treatment_real=applied.loc["FU", "time_on_treatment_real"],
-    time_on_treatment_asper_applications=applied.loc["FU", "time_on_treatment_asper_applications"],
-    applications_planned=FU.planned_applications,
-    avg_dose_planned=100,
-    time_on_treatment_planned=appl_planned,
-)
+row = applied.loc["FU"].copy()
+row["applications_planned"] = FU.planned_applications
+row["avg_dose_planned"] = 100
+row["time_on_treatment_planned"] = appl_planned
+
+rdi = rwd.calculate_rdi(row)
 ```
 
 Four scenarios against the same 4-cycle FLOT plan (`applications_planned=4`,
@@ -151,10 +177,7 @@ applied = rwd.parse_application_string("GEM-9x100", time_on_treatment_real=70, r
 theoretical = rwd.theoretical_applications_table(gem_regime, total_days_on_therapy=70)
 row = applied.join(theoretical).loc["GEM"]
 
-rdi = rwd.calculate_rdi_theoretical(
-    row.avg_dose, row.applications,
-    row.avg_dose_theoretical, row.applications_theoretical,
-)
+rdi = rwd.calculate_rdi_theoretical(row)
 ```
 
 Scenarios for weekly-x3/q28 gemcitabine (day 1, 8, 15 of a 28-day cycle):
@@ -198,6 +221,11 @@ call -- see the note on `case_id` uniqueness below.
 
 Separately from RDI, you can ask: given `total_days_on_therapy`, how many
 applications of a medication would protocol timing have allowed, at most?
+`calculate_applications` answers this via `determine_treatment_days`, which
+does the actual day-bookkeeping: it takes the within-cycle pattern (e.g.
+`[1, 8, 15]`), repeats it every `cycle_len_days` for as many cycles as fit,
+and trims the result at `total_days_on_therapy`. `calculate_applications`
+then just counts how many of those days occurred and reports the last one:
 
 ```python
 n_theoretical, last_day = rwd.calculate_applications(
@@ -214,9 +242,18 @@ medication added only later in the cycle was ever reached:
 rwd.calculate_applications([29], 42, 20)   # (0, None) -- day 29 never reached
 ```
 
-`theoretical_applications_table` runs this over every medication in a
-`Regime` at once, indexed the same way as `parse_application_string`'s
-output so the two can be `.join()`ed:
+The other direction -- from an application *count* to the protocol day it
+falls on -- is `applications_to_treatment_days` (used above by
+`parse_application_string` and by the fixed-cycle-plan example below): given
+`n_applications`, it walks the same within-cycle/`cycle_len_days` pattern
+forward and returns that day, e.g. the 4th FU application on a day-1/q14
+schedule falls on protocol day 42.
+
+`theoretical_applications_table` runs `calculate_applications` over every
+medication in a `Regime` at once (pulling each medication's `treatment_days`/
+`cycle_len` via the small `unpack_regime`/`med_info` accessors rather than
+looping over `regime.meds` by hand), indexed the same way as
+`parse_application_string`'s output so the two can be `.join()`ed:
 
 ```python
 sequence = rwd.Regime("SEQUENCE",
@@ -235,36 +272,88 @@ FU                                  0                    100                    
 OX                                  0                    100                              NaN
 ```
 
+## What the protocol calls for: `planned_applications_table`
+
+The plan-side counterpart to `theoretical_applications_table`, needed by
+`calculate_rdi`: for every medication with `planned_applications` set, it
+calls `applications_to_treatment_days` (above) once to get
+`time_on_treatment_planned` -- the protocol day of the *last planned*
+application -- and reports `applications_planned` and `avg_dose_planned`
+(always 100) alongside it. Unlike the theoretical table, this doesn't depend
+on any observed patient at all, only on the protocol itself. A medication
+with `planned_applications=None` (dosed until progression/toxicity, not for
+a fixed cycle count) gets `NaN` in all three columns rather than `0`, so it
+stays distinguishable from "0 planned" downstream:
+
+```python
+rwd.planned_applications_table(flot)
+```
+
+```
+            applications_planned  avg_dose_planned  time_on_treatment_planned
+medication
+FU                              4               100                         42
+OX                              4               100                         42
+DOC                             4               100                         42
+```
+
 ## Processing many patients: `parse_patient_regimen`
 
 `parse_patient_regimen` composes `calc_total_days_on_therapy`,
-`validate_chemo_protocol`, `parse_application_string` and
-`theoretical_applications_table` into the single call site meant for a
-per-patient loop. It returns `(result, error)` -- exactly one is not
-`None` -- and returns immediately on the first failure, so a bad row never
-falls through to a later step using a stale value from a previous patient:
+`validate_chemo_protocol`, `parse_application_string`,
+`theoretical_applications_table` and `planned_applications_table` into the
+single call site meant for a per-patient loop. It returns `(result, error)`
+-- exactly one is not `None` -- and returns immediately on the first
+failure, so a bad row never falls through to a later step using a stale
+value from a previous patient:
 
 ```python
 res = {}
 errs = {}
 
-for pid, row in v1.set_index("case_id").iterrows():
-    result, error = rwd.parse_patient_regimen(row, regime_dict)
+for idx, row in v1.iterrows():
+    pid = row["ID"]
+    result, error = rwd.parse_patient_regimen(row, regime_dict, case_id="ID")
     if error is not None:
-        errs[pid] = error
+        errs[idx] = row
     else:
-        res[pid] = result
+        res[idx] = result.assign(case_id=pid)
 ```
 
+A raw input table's own index is rarely meaningful (`iterrows()` typically
+walks a default `RangeIndex`, and the real patient id lives in an ordinary
+column, `"ID"` here) -- `case_id="ID"` tells `parse_patient_regimen` to read
+that column for the id it puts in the warning below, instead of falling back
+to `row.name`. If your table *does* have the patient id as its index (e.g.
+after `df.set_index("case_id")`), just omit `case_id` and it uses `row.name`
+directly. Either way, `res`/`errs` above are your own dicts -- key them by
+whatever you find convenient (`idx`, `pid`, ...); `parse_patient_regimen`
+doesn't care, `case_id` only affects the warning message.
+
 `result` is `parse_application_string`'s output joined with
-`theoretical_applications_table`'s -- the real-vs-theoretical table for
-every medication in that patient's regime in one DataFrame, plus an
+`theoretical_applications_table`'s and `planned_applications_table`'s -- one
+row per medication with everything either RDI function needs already on it:
+the real columns (`applications`, `avg_dose`, ...), the theoretical-null-model
+columns (`applications_theoretical`, `avg_dose_theoretical`, ...) and the
+fixed-cycle-plan columns (`applications_planned`, `avg_dose_planned`,
+`time_on_treatment_planned` -- `NaN` for a medication with no
+`planned_applications`, i.e. dosed open-ended). This is what makes a mixed
+regime (some medications on a fixed cycle count, others dosed until
+progression/toxicity) a single parse instead of two: `calculate_rdi` and
+`calculate_rdi_theoretical` each just read the columns they need off the same
+row, and `calculate_rdi_combined` picks the right one automatically per
+medication --
+
+```python
+result["rdi"] = result.apply(rwd.calculate_rdi_combined, axis=1)
+```
+
+`result` also carries an
 `applications_exceed_theoretical` column (`applications > applications_theoretical`)
 flagging rows worth checking before trusting their RDI -- usually bad input
 data, not a real dose-dense course (see `calculate_rdi_theoretical` above).
-Every flagged row also raises a `SuspectApplicationCountWarning`, naming
-`row.name` as the case id -- which is exactly `pid` above, since `row.name`
-is whatever the DataFrame was indexed by before `.iterrows()`:
+Every flagged row also raises a `SuspectApplicationCountWarning`, naming the
+`case_id` value resolved as above:
 
 ```
 SuspectApplicationCountWarning: case_id='PATIENT-007' medication=FU: 5 Gaben
@@ -278,7 +367,8 @@ Differenz -2d) -- Erste_Gabe_Datum/Letzte_Gabe_Datum und Zyklenzahl pruefen.
 application string that doesn't validate against the resolved regime), for
 review.
 
-`case_id` must be unique per row: a patient whose regime changed mid-course
+The patient id -- whether it's the DataFrame index or an `"ID"` column --
+must be unique per row you feed in: a patient whose regime changed mid-course
 (see above) needs one row per segment, each with its own
 Erste_Gabe/Letzte_Gabe -- otherwise the later row silently overwrites the
 earlier one in `res`.
